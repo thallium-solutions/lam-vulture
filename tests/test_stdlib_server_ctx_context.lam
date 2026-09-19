@@ -1,0 +1,26 @@
+# expect: ctx-body: has=true in=true expired=true reason=stopped value=<nil>
+
+from @lam/vulture import Request, Response, Server
+
+func prepare(req: Request, res: Response) {
+    req.ctx["nullable"] = None
+    req.ctx.cancel("stopped")
+}
+
+func inspect(req: Request, res: Response) {
+    hasValue: bool = req.ctx.has("nullable")
+    containsValue: bool = "nullable" in req.ctx
+    expired: bool = req.ctx.expired()
+    reason: any = req.ctx.reason()
+    value: any = req.ctx["nullable"]
+    res.text(f"has={hasValue} in={containsValue} expired={expired} reason={reason} value={value}")
+}
+
+func main() {
+    server: Server = Server()
+    server.preHandler(prepare)
+    server.get("/ctx", inspect)
+    response: dict[str, any] = server.inject("GET", "/ctx")
+    body: any = response["body"]
+    print(f"ctx-body: {body}")
+}
