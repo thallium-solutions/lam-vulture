@@ -15,7 +15,8 @@
 # expect: ok
 
 from @lam/vulture import Server, Request, Response
-from lamhttp import Http
+from lamerrors import Result
+from lamhttp import Http, HttpResponse
 from lamjson import Json
 from lamos import Os
 
@@ -54,18 +55,27 @@ go! {
     }
 }
 
-func jsonHandler(req: Request, res: Response) {
-    body: json = req.jsonBody()
-    if Json.kind(body) == "null" {
-        res.error_(400, "bad json")
-        return
+func responseBody(result: Result[HttpResponse]) -> str {
+    go! {
+        return result.Value.(*HttpResponse).Body
     }
+}
+
+func resultJson(req: Request) -> json {
+    result: Result[json] = req.jsonBody()
+    go! {
+        return result.Value.(LamJSON)
+    }
+}
+
+func jsonHandler(req: Request, res: Response) {
+    body: json = resultJson(req)
     name: str = body.name
     res.text("hello, " + name)
 }
 
 func cookieHandler(req: Request, res: Response) {
-    sess: str = req.cookie("session")
+    sess: str = str(req.cookie("session").value)
     res.text("session=" + sess)
 }
 
@@ -80,7 +90,7 @@ func main() {
     srv.static_("/assets", tmp)
     srv.post("/json", jsonHandler)
     srv.get("/cookie", cookieHandler)
-    srv.listenBackground(18585)
+    _ = srv.listenBackground(18585).unwrap()
 
     indexStatus: int = 0
     indexBody: str = ""
@@ -90,10 +100,10 @@ func main() {
     print(f"index status: {indexStatus}")
     print(f"index body: {indexBody}")
 
-    cssCt: str = Http.getHeader("http://127.0.0.1:18585/assets/style.css", "Content-Type")
+    cssCt: str = str(Http.getHeader("http://127.0.0.1:18585/assets/style.css", "Content-Type").value)
     print(f"css ct: {cssCt}")
 
-    helloBody: str = Http.post("http://127.0.0.1:18585/json", {"name": "alice"})
+    helloBody: str = responseBody(Http.post("http://127.0.0.1:18585/json", {"name": "alice"}))
     print(f"json: {helloBody}")
 
     cookieBody: str = ""

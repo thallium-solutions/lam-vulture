@@ -24,7 +24,7 @@
 # expect: httperr-body-has-message: true
 # expect: panic-after-many: 200
 
-from @lam/vulture import Server, Request, Response, HttpError
+from @lam/vulture import InjectResponse, Server, Request, Response, HttpError
 
 func aliveHandler(req: Request, res: Response) {
     res.text("alive")
@@ -71,18 +71,18 @@ func main() {
     srv.get("/onresp-panic", aliveHandler)
 
     # ── Healthy baseline
-    ok: dict[str, any] = srv.inject("GET", "/alive")
-    oks: any = ok["status"]
-    okb: any = ok["body"]
+    ok: InjectResponse = srv.inject("GET", "/alive")
+    oks: any = ok.status
+    okb: any = ok.body
     print(f"ok-status: {oks}")
     print(f"ok-body: {okb}")
 
     # ── Handler panic → 500, then a second request should still work
-    boom: dict[str, any] = srv.inject("GET", "/boom")
-    booms: any = boom["status"]
+    boom: InjectResponse = srv.inject("GET", "/boom")
+    booms: any = boom.status
     print(f"panic-handler-status: {booms}")
-    after: dict[str, any] = srv.inject("GET", "/alive")
-    afters: any = after["status"]
+    after: InjectResponse = srv.inject("GET", "/alive")
+    afters: any = after.status
     survives1: bool = false
     go! {
         if v, ok := afters.(int); ok && v == 200 {
@@ -92,11 +92,11 @@ func main() {
     print(f"panic-handler-survives: {survives1}")
 
     # ── onRequest panic → 500 + listener intact
-    onreq: dict[str, any] = srv.inject("GET", "/onreq-panic")
-    onreqs: any = onreq["status"]
+    onreq: InjectResponse = srv.inject("GET", "/onreq-panic")
+    onreqs: any = onreq.status
     print(f"panic-onreq-status: {onreqs}")
-    after2: dict[str, any] = srv.inject("GET", "/alive")
-    after2s: any = after2["status"]
+    after2: InjectResponse = srv.inject("GET", "/alive")
+    after2s: any = after2.status
     survives2: bool = false
     go! {
         if v, ok := after2s.(int); ok && v == 200 {
@@ -106,11 +106,11 @@ func main() {
     print(f"panic-onreq-survives: {survives2}")
 
     # ── preHandler panic
-    pre: dict[str, any] = srv.inject("GET", "/pre-panic")
-    pres: any = pre["status"]
+    pre: InjectResponse = srv.inject("GET", "/pre-panic")
+    pres: any = pre.status
     print(f"panic-prehandler-status: {pres}")
-    after3: dict[str, any] = srv.inject("GET", "/alive")
-    after3s: any = after3["status"]
+    after3: InjectResponse = srv.inject("GET", "/alive")
+    after3s: any = after3.status
     survives3: bool = false
     go! {
         if v, ok := after3s.(int); ok && v == 200 {
@@ -122,8 +122,8 @@ func main() {
     # ── onResponse panic — the request response is already sent;
     #    we just check the listener still serves a fresh request.
     srv.inject("GET", "/onresp-panic")
-    after4: dict[str, any] = srv.inject("GET", "/alive")
-    after4s: any = after4["status"]
+    after4: InjectResponse = srv.inject("GET", "/alive")
+    after4s: any = after4.status
     survives4: bool = false
     go! {
         if v, ok := after4s.(int); ok && v == 200 {
@@ -133,9 +133,9 @@ func main() {
     print(f"panic-onresponse-survives: {survives4}")
 
     # ── HttpError lowering
-    tea: dict[str, any] = srv.inject("GET", "/tea")
-    teas: any = tea["status"]
-    teab: any = tea["body"]
+    tea: InjectResponse = srv.inject("GET", "/tea")
+    teas: any = tea.status
+    teab: any = tea.body
     print(f"httperr-status: {teas}")
     teabHas: bool = false
     go! {
@@ -150,8 +150,8 @@ func main() {
         srv.inject("GET", "/boom")
         srv.inject("GET", "/alive")
     }
-    final: dict[str, any] = srv.inject("GET", "/alive")
-    finals: any = final["status"]
+    final: InjectResponse = srv.inject("GET", "/alive")
+    finals: any = final.status
     print(f"panic-after-many: {finals}")
 }
 

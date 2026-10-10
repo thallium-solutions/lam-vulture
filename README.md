@@ -12,7 +12,7 @@ formerly supplied by Lammergeier's `lamserver` standard-library module.
 
 ## Requirements
 
-- `lamc` 1.17.0 or newer (`^1.17` compatibility).
+- `lamc` 1.18.0 or newer (`^1.18` compatibility).
 - A Go toolchain available to `lamc`.
 
 ## Installation
@@ -26,7 +26,7 @@ lamc install https://github.com/thallium-solutions/lam-vulture.git
 Install the registry release:
 
 ```bash
-lamc install @lam/vulture@1.0.0
+lamc install @lam/vulture@2.0.0
 ```
 
 Install a local checkout during development:
@@ -58,7 +58,7 @@ func main() {
     app: Server = Server()
     app.get("/health", health)
     app.get("/users/:id", showUser)
-    app.listen(8080)
+    _ = app.listen(8080).unwrap()
 }
 ```
 
@@ -99,7 +99,7 @@ func protectedRoutes(app: Server) {
 func main() {
     app: Server = Server()
     app.register(protectedRoutes, "/v1", true)
-    app.listen(8080)
+    _ = app.listen(8080).unwrap()
 }
 ```
 
@@ -116,7 +116,7 @@ core server:
 without binding a network port:
 
 ```lammergeier
-from @lam/vulture import Server, Request, Response
+from @lam/vulture import InjectResponse, Server, Request, Response
 
 func echo(req: Request, res: Response) {
     res.text(req.body)
@@ -126,35 +126,78 @@ func main() {
     app: Server = Server()
     app.post("/echo", echo)
 
-    result: dict[str, any] = app.inject("POST", "/echo", "hello")
-    print(result["status"])
-    print(result["body"])
+    result: InjectResponse = app.inject("POST", "/echo", "hello")
+    print(result.status)
+    print(result.body)
 }
 ```
 
 For a real listener, use `listen` or `listenTLS`; their background variants are
-intended primarily for tests. Call `shutdown(timeoutMs)` for graceful draining
-or `close()` for immediate shutdown.
+intended primarily for tests. All four operations return `Result[bool]`, so bind,
+certificate, and synchronous serve failures are explicit. Call
+`shutdown(timeoutMs)` for graceful draining or `close()` for immediate shutdown.
+
+## Version 2 failure and routing conventions
+
+Expected operational failures use unsuffixed `Result[T]` APIs. There are no
+throwing/`try*` or sentinel-returning twins:
+
+- `listen`, `listenBackground`, `listenTLS`, and `listenTLSBackground` return
+  `Result[bool]`.
+- `RequestBodyReader.read`, `readAll`, and `copyTo` return `Result` values;
+  EOF is `Ok("")`, while I/O and body-limit failures are errors.
+- `Request.cookie`, `signedCookie`, `jsonBody`, and `parsedBody` return `Result`
+  values. Missing, malformed, or signature-invalid data is never reported as an
+  empty string, JSON null, or `None` sentinel.
+
+Per-route configuration uses `RouteOptions` and actual `route`, `get`, `post`,
+`put`, `del`, `patch`, `head`, `options`, and `all` overloads:
+
+```lammergeier
+from @lam/vulture import Request, Response, RouteOptions, Server
+
+func upload(req: Request, res: Response) {
+    reader = req.bodyReader()
+    body: str = str(reader.readAll().unwrap())
+    res.text(body)
+}
+
+func main() {
+    app: Server = Server()
+    options: RouteOptions = RouteOptions(1048576, 30000, true)
+    options.summary = "Stream an upload"
+    options.tags = ["uploads"]
+    app.post("/uploads", upload, options)
+    _ = app.listen(8080).unwrap()
+}
+```
+
+`RouteOptions.withSchema` accepts heterogeneous JSON Schema trees, and
+`metadata` accepts opaque application values; these are documented dynamic
+boundaries. Handlers, hooks, plugins, SSE emitters, content-type parsers, and
+schema-error formatters use Lam 1.18 function types.
 
 ## API overview
 
 The complete public implementation is exported from `__init__.lam`.
 
-- `Server` — route registration (`route`, `routeOpts`, verb helpers, `all`),
-  hooks, plugins, decorators, custom content-type parsers, shared schemas,
+- `Server` — overloaded route registration with typed `RouteOptions`, typed
+  hooks and plugins, decorators, custom content-type parsers, shared schemas,
   request limits and timeouts, CORS/security headers, static mounts, versioned
-  routes, listeners/TLS/shutdown, `inject`, `listRoutes`, `printRoutes`, and
-  `openapi`.
+  routes, Result-based listeners/TLS, shutdown, typed `inject`, `listRoutes`,
+  `printRoutes`, and `openapi`.
 - `Request` — method/path/body/header/query/parameter data, cancellation-aware
-  `ctx`, parsed JSON/form/multipart bodies, cookies and signed cookies,
-  streaming body readers, proxy-aware IP/scheme helpers, decorators, request
-  IDs, route metadata, timing, and URL helpers.
+  `ctx`, Result-based JSON/form parsing and cookie verification, multipart
+  bodies, streaming body readers, proxy-aware IP/scheme helpers, decorators,
+  request IDs, route metadata, timing, and URL helpers.
 - `Response` — status/header/body builders, JSON/text/HTML/redirect/error
   responses, pagination, cookies and signed cookies, file streaming, SSE,
   HTTP/2 push, decorators, serialization, response timing, not-found handoff,
   and connection hijacking.
 - `HttpError` — typed HTTP failures with common status constructors.
-- `RequestBodyReader` — incremental and file-backed request-body consumption.
+- `RequestBodyReader` — Result-based incremental and file-backed request-body consumption.
+- `RouteOptions` — typed per-route limits, timeout, streaming, hooks, schemas, and metadata.
+- `InjectResponse` — typed `status`, `body`, and `headers` from in-process dispatch.
 - `SseEmitter` — Server-Sent Event data, named events, comments, and close.
 
 Route schemas can validate body, query, path parameters, and headers and can
@@ -185,7 +228,7 @@ project response payloads. `listRoutes`, `printRoutes`, `routeOptions`, and
 python3 tests/run_tests.py --verbose
 ```
 
-The runner requires `lamc >= 1.17.0`, stages this checkout as
+The runner requires `lamc >= 1.18.0`, stages this checkout as
 `extlibs/@lam/vulture` in an isolated temporary directory, compiles without the
 compiler cache, runs every migrated central end-to-end server test, and compares
 stdout against the original exact `# expect:` output. Tests for the standard

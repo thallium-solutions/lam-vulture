@@ -10,10 +10,19 @@
 # expect: GET /admin (with auth) -> admin ok
 # expect: header X-Server present: true
 # expect: 404 path: 404 not found
+# expect: listen conflict error: true
+# expect: tls startup error: true
 # expect: server_tests_ok
 
 from @lam/vulture import Server, Request, Response
-from lamhttp import Http
+from lamerrors import Result
+from lamhttp import Http, HttpResponse
+
+func responseBody(result: Result[HttpResponse]) -> str {
+    go! {
+        return result.Value.(*HttpResponse).Body
+    }
+}
 
 func logRequest(req: Request, res: Response) {
     # No-op hook just to prove ``onRequest`` fires for every request.
@@ -72,26 +81,36 @@ func main() {
     # Plugin contributes the /admin route + auth hook
     srv.register(authPlugin)
 
-    srv.listenBackground(18181)
+    _ = srv.listenBackground(18181).unwrap()
 
     # Hit the server; lamhttp's default client is fine for tests.
-    print("GET /hello -> " + Http.get("http://127.0.0.1:18181/hello"))
-    print("GET /user/42 -> " + Http.get("http://127.0.0.1:18181/user/42"))
-    print("POST /echo -> " + Http.post("http://127.0.0.1:18181/echo", "text/plain", "ping"))
-    print("GET /admin (without auth) -> " + Http.get("http://127.0.0.1:18181/admin"))
+    print("GET /hello -> " + responseBody(Http.get("http://127.0.0.1:18181/hello")))
+    print("GET /user/42 -> " + responseBody(Http.get("http://127.0.0.1:18181/user/42")))
+    print("POST /echo -> " + responseBody(Http.post("http://127.0.0.1:18181/echo", "text/plain", "ping")))
+    print("GET /admin (without auth) -> " + responseBody(Http.get("http://127.0.0.1:18181/admin")))
 
     # Authorised request: pass the bearer header.
     headers: dict[str, str] = {}
     headers["Authorization"] = "Bearer s3cret"
-    print("GET /admin (with auth) -> " + Http.getWithHeaders("http://127.0.0.1:18181/admin", headers))
+    print("GET /admin (with auth) -> " + responseBody(Http.getWithHeaders("http://127.0.0.1:18181/admin", headers)))
 
     # Verify the onResponse hook (X-Server header) actually fires.
-    serverHeader: str = Http.getHeader("http://127.0.0.1:18181/hello", "X-Server")
+    serverHeader: str = str(Http.getHeader("http://127.0.0.1:18181/hello", "X-Server").value)
     headerOk: bool = serverHeader == "lamserver/1"
     print(f"header X-Server present: {headerOk}")
 
     # Unknown path → 404
-    print("404 path: " + Http.get("http://127.0.0.1:18181/no-such-path"))
+    print("404 path: " + responseBody(Http.get("http://127.0.0.1:18181/no-such-path")))
+
+    conflict: Server = Server()
+    print("listen conflict error: " + str(not conflict.listenBackground(18181).ok()))
+    badTls: Server = Server()
+    tlsStarted: Result[bool] = badTls.listenTLSBackground(
+    0,
+    "/definitely/missing/lam-vulture-cert.pem",
+    "/definitely/missing/lam-vulture-key.pem",
+    )
+    print("tls startup error: " + str(not tlsStarted.ok()))
 
     srv.close()
     print("server_tests_ok")

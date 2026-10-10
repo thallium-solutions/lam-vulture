@@ -23,7 +23,7 @@
 # expect: t4-deprecated-flag: true
 # expect: t4-sorted: true
 
-from @lam/vulture import Server, Request, Response
+from @lam/vulture import InjectResponse, RouteOptions, Server, Request, Response
 
 go! {
     import (
@@ -64,19 +64,19 @@ func main() {
 
     # Response schema: only ``name`` is projected out.
     userSchema: str = '{"type":"object","properties":{"name":{"type":"string"}},"additionalProperties":false}'
-    srv.getOpts("/schema", schemaHandler, {
-        "schema": {"response": {"200": userSchema}},
-    })
+    schemaOptions: RouteOptions = RouteOptions()
+    schemaOptions.withSchema( {"response": {"200": userSchema}})
+    srv.get("/schema", schemaHandler, schemaOptions)
     srv.get("/string", stringHandler)
 
     # ── Test 1: plain serialize
-    r1: dict[str, any] = srv.inject("GET", "/plain")
-    b1: any = r1["body"]
+    r1: InjectResponse = srv.inject("GET", "/plain")
+    b1: any = r1.body
     print("t1-plain: " + str(b1))
 
     # ── Test 2: schema-aware serialize
-    r2: dict[str, any] = srv.inject("GET", "/schema")
-    b2: any = r2["body"]
+    r2: InjectResponse = srv.inject("GET", "/schema")
+    b2: any = r2.body
     # Parse the body, check fields.
     keepsName: bool = false
     dropsSecret: bool = false
@@ -98,8 +98,8 @@ func main() {
     print(f"t2-drops-extra-fields: {dropsSecret}")
 
     # ── Test 3: strings round-trip unchanged
-    r3: dict[str, any] = srv.inject("GET", "/string")
-    b3: any = r3["body"]
+    r3: InjectResponse = srv.inject("GET", "/string")
+    b3: any = r3.body
     print("t3-string: " + str(b3))
 
     # ── Test 4: printRoutes() — register a mix of routes and
@@ -107,18 +107,14 @@ func main() {
     srv2: Server = Server()
     srv2.get("/", noop)
     srv2.get("/alpha", noop)
-    srv2.routeOpts("POST", "/uploads", noop, {
-        "streamBody": true,
-        "bodyLimit": 1048576,
-        "summary": "Bulk upload",
-        "tags": ["admin"],
-    })
-    srv2.routeOpts("PUT", "/legacy", noop, {
-        "deprecated": true,
-    })
-    srv2.routeOpts("GET", "/slow", noop, {
-        "timeoutMs": 250,
-    })
+    uploadOptions: RouteOptions = RouteOptions(1048576, 0, true)
+    uploadOptions.summary = "Bulk upload"
+    uploadOptions.tags = ["admin"]
+    srv2.post("/uploads", noop, uploadOptions)
+    legacyOptions: RouteOptions = RouteOptions()
+    legacyOptions.deprecated = true
+    srv2.put("/legacy", noop, legacyOptions)
+    srv2.get("/slow", noop, RouteOptions(0, 250))
 
     table: str = srv2.printRoutes()
 

@@ -17,7 +17,7 @@
 # expect: real ip xff: 9.9.9.9
 # expect: real ip 2 hops: 5.5.5.5
 
-from @lam/vulture import Server, Request, Response
+from @lam/vulture import InjectResponse, RouteOptions, Server, Request, Response
 
 go! {
     import "strings"
@@ -77,19 +77,18 @@ func main() {
 
     # Route options: bodyLimit, per-route preHandler, onResponse,
     # plus summary + tags echoed by listRoutes.
-    optsLimited: dict[str, any] = {}
-    optsLimited["bodyLimit"] = 8
-    srv.postOpts("/echo", smallEcho, optsLimited)
+    optsLimited: RouteOptions = RouteOptions(8)
+    srv.post("/echo", smallEcho, optsLimited)
 
-    optsBlocker: dict[str, any] = {}
-    optsBlocker["preHandler"] = ctxAuthBlocker
-    optsBlocker["summary"] = "create user"
-    optsBlocker["tags"] = ["users", "write"]
-    srv.postOpts("/users", mainHandler, optsBlocker)
+    optsBlocker: RouteOptions = RouteOptions()
+    optsBlocker.preHandler(ctxAuthBlocker)
+    optsBlocker.summary = "create user"
+    optsBlocker.tags = ["users", "write"]
+    srv.post("/users", mainHandler, optsBlocker)
 
-    optsResp: dict[str, any] = {}
-    optsResp["onResponse"] = ctxRouteResp
-    srv.getOpts("/probe", mainHandler, optsResp)
+    optsResp: RouteOptions = RouteOptions()
+    optsResp.onResponse(ctxRouteResp)
+    srv.get("/probe", mainHandler, optsResp)
 
     # ── multipart upload route
     srv.post("/upload", uploadHandler)
@@ -102,25 +101,25 @@ func main() {
     go! {
         over = strings.Repeat("x", 32)
     }
-    rb: dict[str, any] = srv.inject("POST", "/echo", over)
-    rbs: any = rb["status"]
+    rb: InjectResponse = srv.inject("POST", "/echo", over)
+    rbs: any = rb.status
     print(f"route limit 413: {rbs}")
 
     # Within limit — 200
-    rb2: dict[str, any] = srv.inject("POST", "/echo", "abc")
-    rb2s: any = rb2["status"]
+    rb2: InjectResponse = srv.inject("POST", "/echo", "abc")
+    rb2s: any = rb2.status
     print(f"route limit ok: {rb2s}")
 
     # Per-route preHandler short-circuits the route handler
-    rg: dict[str, any] = srv.inject("POST", "/users", "{}")
-    rgb: any = rg["body"]
+    rg: InjectResponse = srv.inject("POST", "/users", "{}")
+    rgb: any = rg.body
     print(f"route pre fired: {rgb}")
 
     # Per-route onResponse fires after success; check counter on a
     # fresh request via the response body … inject doesn't carry
     # ctx out, so we just verify status here.
-    rp: dict[str, any] = srv.inject("GET", "/probe")
-    rps: any = rp["status"]
+    rp: InjectResponse = srv.inject("GET", "/probe")
+    rps: any = rp.status
     routeCount: int = 0
     if rps == 200 {
         routeCount = 1
@@ -173,8 +172,8 @@ func main() {
     }
     h: dict[str, str] = {}
     h["Content-Type"] = "multipart/form-data; boundary=" + boundary
-    ru: dict[str, any] = srv.inject("POST", "/upload", body, h)
-    rub: any = ru["body"]
+    ru: InjectResponse = srv.inject("POST", "/upload", body, h)
+    rub: any = ru.body
     rustr: str = ""
     go! {
         if s, ok := rub.(string); ok {
@@ -195,8 +194,8 @@ func main() {
     print(f"form file body: {pfbody}")
 
     # ── realIP without trustProxy: returns RemoteAddr host
-    riNone: dict[str, any] = srv.inject("GET", "/whoami")
-    riNoneB: any = riNone["body"]
+    riNone: InjectResponse = srv.inject("GET", "/whoami")
+    riNoneB: any = riNone.body
     print(f"real ip none: {riNoneB}")
 
     # ── realIP with trustProxy enabled (1 hop)
@@ -204,13 +203,13 @@ func main() {
     srv.trustProxy(headers, 1)
     h2: dict[str, str] = {}
     h2["X-Forwarded-For"] = "1.1.1.1, 5.5.5.5, 9.9.9.9"
-    ri: dict[str, any] = srv.inject("GET", "/whoami", "", h2)
-    rib: any = ri["body"]
+    ri: InjectResponse = srv.inject("GET", "/whoami", "", h2)
+    rib: any = ri.body
     print(f"real ip xff: {rib}")
 
     # ── 2 hops: returns the second-from-rightmost IP
     srv.trustProxy(headers, 2)
-    ri2: dict[str, any] = srv.inject("GET", "/whoami", "", h2)
-    ri2b: any = ri2["body"]
+    ri2: InjectResponse = srv.inject("GET", "/whoami", "", h2)
+    ri2b: any = ri2.body
     print(f"real ip 2 hops: {ri2b}")
 }

@@ -1,0 +1,191 @@
+# Complex v2 contract: typed routes/plugins/hooks, Result failures, inject,
+# contexts/timeouts, and the fluent HTTP client against an ephemeral listener.
+# expect: inject status: 200
+# expect: inject plugin context: true
+# expect: inject route hooks: PVHSN
+# expect: inject header case-fold: true
+# expect: json error: true
+# expect: parsed body error: true
+# expect: cookie error: true
+# expect: body copy error: true
+# expect: ephemeral listen: true
+# expect: builder result: true
+# expect: builder status: 200
+# expect: builder body: Ada|builder|typed|PVH
+# expect: builder hooks: PVHSN
+# expect: timeout status: 408
+# expect: timeout hook: fired
+# expect: listen conflict error: true
+# expect: onResponse observed: true
+
+from @lam/vulture import Server, Request, Response, RouteOptions, InjectResponse
+from lamerrors import Result
+from lamhttp import HttpClient, HttpResponse
+
+
+go! {
+    import (
+        "net"
+        "strconv"
+        "sync/atomic"
+        "time"
+    )
+
+    var lamCrossFeatureResponses int64
+}
+
+func pluginContext(req: Request, res: Response) {
+    req.ctx["plugin"] = "typed"
+    req.ctx["ladder"] = ""
+}
+
+func typedPlugin(server: Server) {
+    server.onRequest(pluginContext)
+}
+
+func preParse(req: Request, res: Response) {
+    req.ctx["ladder"] = str(req.ctx["ladder"]) + "P"
+}
+
+func preValidate(req: Request, res: Response) {
+    req.ctx["ladder"] = str(req.ctx["ladder"]) + "V"
+}
+
+func preHandle(req: Request, res: Response) {
+    req.ctx["ladder"] = str(req.ctx["ladder"]) + "H"
+}
+
+func preSerialize(req: Request, res: Response) {
+    res.setHeader("X-Ladder", str(req.ctx["ladder"]) + "S")
+}
+
+func sendHook(req: Request, res: Response) {
+    res.setHeader("X-Ladder", res.headers["X-Ladder"] + "N")
+}
+
+func responseHook(req: Request, res: Response) {
+    go! {
+        atomic.AddInt64(&lamCrossFeatureResponses, 1)
+    }
+}
+
+func timeoutHook(req: Request, res: Response) {
+    res.setHeader("X-Timeout", "fired")
+}
+
+func resultJson(result: Result[json]) -> json {
+    go! {
+        return result.Value.(LamJSON)
+    }
+}
+
+func v2Handler(req: Request, res: Response) {
+    payload: json = resultJson(req.jsonBody())
+    name: str = payload.name
+    res.text(name + "|" + req.queryGet("source", "missing") + "|" +
+    str(req.ctx["plugin"]) + "|" + str(req.ctx["ladder"]))
+}
+
+func errorHandler(req: Request, res: Response) {
+    jsonResult: Result[json] = req.jsonBody()
+    parsedResult: Result[any] = req.parsedBody()
+    cookieResult: Result[str] = req.cookie("missing")
+    copied: Result[int] = req.bodyReader().copyTo("/definitely/missing/lam-vulture/body.bin")
+    res.setHeader("X-Json-Error", str(not jsonResult.ok()))
+    res.setHeader("X-Parsed-Error", str(not parsedResult.ok()))
+    res.setHeader("X-Cookie-Error", str(not cookieResult.ok()))
+    res.setHeader("X-Body-Error", str(not copied.ok()))
+    res.text("errors checked")
+}
+
+func slowHandler(req: Request, res: Response) {
+    go! {
+        time.Sleep(100 * time.Millisecond)
+    }
+    res.text("late")
+}
+
+func portOf(address: str) -> int {
+    port: int = 0
+    go! {
+        _, text, err := net.SplitHostPort(address)
+        if err == nil {
+            port, _ = strconv.Atoi(text)
+        }
+    }
+    return port
+}
+
+func main() {
+    server: Server = Server()
+    plugin: func(Server) = typedPlugin
+    server.register(plugin)
+    server.onTimeout(timeoutHook)
+
+    v2Options: RouteOptions = RouteOptions(1024, 0, false)
+    _ = v2Options.preParsing(preParse)
+    _ = v2Options.preValidation(preValidate)
+    _ = v2Options.preHandler(preHandle)
+    _ = v2Options.preSerialization(preSerialize)
+    _ = v2Options.onSend(sendHook)
+    _ = v2Options.onResponse(responseHook)
+    _ = v2Options.metadata("contract", "v2")
+    server.route("POST", "/v2", v2Handler, v2Options)
+
+    errorOptions: RouteOptions = RouteOptions(1024)
+    server.post("/errors", errorHandler, errorOptions)
+    timeoutOptions: RouteOptions = RouteOptions(0, 20)
+    server.get("/slow", slowHandler, timeoutOptions)
+
+    injected: InjectResponse = server.inject(
+    "POST",
+    "/v2?source=inject",
+    "{\"name\":\"Ivy\"}",
+    {"Content-Type": "application/json"},
+    )
+    print(f"inject status: {injected.status}")
+    print("inject plugin context: " + str(injected.body == "Ivy|inject|typed|PVH"))
+    print("inject route hooks: " + injected.header("X-Ladder"))
+    print("inject header case-fold: " + str(injected.header("x-ladder") == "PVHSN"))
+
+    failures: InjectResponse = server.inject(
+    "POST",
+    "/errors",
+    "{",
+    {"Content-Type": "application/json"},
+    )
+    print("json error: " + failures.header("X-Json-Error"))
+    print("parsed body error: " + failures.header("X-Parsed-Error"))
+    print("cookie error: " + failures.header("X-Cookie-Error"))
+    print("body copy error: " + failures.header("X-Body-Error"))
+
+    started: Result[bool] = server.listenBackground(0)
+    print("ephemeral listen: " + str(started.ok()))
+    client: HttpClient = HttpClient("http://" + server.boundAddr, 1000)
+    built: Result[HttpResponse] = client.build("POST", "/v2")
+        .query("source", "builder")
+        .header("Cookie", "session=local")
+        .timeout(500)
+        .json({"name": "Ada"})
+        .send()
+    print("builder result: " + str(built.ok()))
+    response: HttpResponse = built.unwrap()
+    print(f"builder status: {response.status}")
+    print("builder body: " + response.body)
+    print("builder hooks: " + response.header("x-ladder"))
+
+    timed: HttpResponse = client.get("/slow").unwrap()
+    print(f"timeout status: {timed.status}")
+    print("timeout hook: " + timed.header("X-Timeout"))
+
+    conflict: Server = Server()
+    conflictResult: Result[bool] = conflict.listenBackground(portOf(server.boundAddr))
+    print("listen conflict error: " + str(not conflictResult.ok()))
+
+    observed: bool = false
+    go! {
+        observed = atomic.LoadInt64(&lamCrossFeatureResponses) >= 2
+    }
+    print("onResponse observed: " + str(observed))
+    server.close()
+}

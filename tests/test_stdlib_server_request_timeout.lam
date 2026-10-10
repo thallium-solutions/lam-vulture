@@ -23,7 +23,7 @@
 # expect: t3-status: 200
 # expect: t3-body: too late
 
-from @lam/vulture import Server, Request, Response
+from @lam/vulture import RouteOptions, Server, Request, Response
 from lamtime import Time
 
 go! {
@@ -87,14 +87,10 @@ func main() {
     srv.setRequestTimeout(50)  # 50ms server default
     srv.onTimeout(bumpTimeoutCounter)
     srv.get("/slow-default", slowHandler)
-    srv.routeOpts("GET", "/slow-fast", slowHandler, {
-        "timeoutMs": 1000,  # override default → completes
-    })
-    srv.routeOpts("GET", "/slow-tight", slowHandler, {
-        "timeoutMs": 30,  # override default → tighter
-    })
+    srv.get("/slow-fast", slowHandler, RouteOptions(0, 1000))
+    srv.get("/slow-tight", slowHandler, RouteOptions(0, 30))
 
-    srv.listenBackground(0)
+    _ = srv.listenBackground(0).unwrap()
     addr: str = srv.boundAddr
 
     # Server-default timeout (50ms) trips on the 300ms handler → 408

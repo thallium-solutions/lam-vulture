@@ -1,6 +1,6 @@
 [library]
 name = "@lam/vulture"
-version = "1.0.0"
+version = "2.0.0"
 description = "Fastify-style HTTP server for Lammergeier"
 license = "Apache-2.0"
 authors = ["Lammergeier contributors"]
@@ -8,7 +8,7 @@ repository = "https://github.com/thallium-solutions/lam-vulture"
 homepage = "https://github.com/thallium-solutions/lam-vulture"
 
 [compatibility]
-lamc = "^1.17"
+lamc = "^1.18"
 
 [scripts]
 test = "python3 tests/run_tests.py --verbose"

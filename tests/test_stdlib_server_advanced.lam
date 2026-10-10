@@ -25,7 +25,8 @@
 # expect: shutdown ok
 
 from @lam/vulture import Server, Request, Response
-from lamhttp import Http
+from lamerrors import Result
+from lamhttp import Http, HttpResponse
 
 go! {
     import (
@@ -81,6 +82,12 @@ go! {
         }
         defer resp.Body.Close()
         return resp.Header.Get(header)
+    }
+}
+
+func responseBody(result: Result[HttpResponse]) -> str {
+    go! {
+        return result.Value.(*HttpResponse).Body
     }
 }
 
@@ -158,9 +165,9 @@ func main() {
     srv.register(v1Plugin, "/v1")
     srv.register(v2Plugin, "/v2")
 
-    srv.listenBackground(18484)
+    _ = srv.listenBackground(18484).unwrap()
 
-    qBody: str = Http.get("http://127.0.0.1:18484/q?name=alice")
+    qBody: str = responseBody(Http.get("http://127.0.0.1:18484/q?name=alice"))
     print(f"query: {qBody}")
 
     rStatus: int = 0
@@ -172,7 +179,7 @@ func main() {
     print(f"redirect status: {rStatus}")
     print(f"redirect location: {rLoc}")
 
-    htmlCt: str = Http.getHeader("http://127.0.0.1:18484/h", "Content-Type")
+    htmlCt: str = str(Http.getHeader("http://127.0.0.1:18484/h", "Content-Type").value)
     print(f"html ct: {htmlCt}")
 
     teapotStatus: int = 0
@@ -183,7 +190,7 @@ func main() {
     }
     print(f"teapot: {teapotStatus} {teapotBody}")
 
-    setCookie: str = Http.getHeader("http://127.0.0.1:18484/c", "Set-Cookie")
+    setCookie: str = str(Http.getHeader("http://127.0.0.1:18484/c", "Set-Cookie").value)
     cookieOk: bool = setCookie != ""
     print(f"cookie set: {cookieOk}")
 
@@ -196,8 +203,8 @@ func main() {
     print(f"405 status: {methodsStatus}")
     print(f"405 allow: {methodsAllow}")
 
-    v1: str = Http.get("http://127.0.0.1:18484/v1/hello")
-    v2: str = Http.get("http://127.0.0.1:18484/v2/hello")
+    v1: str = responseBody(Http.get("http://127.0.0.1:18484/v1/hello"))
+    v2: str = responseBody(Http.get("http://127.0.0.1:18484/v2/hello"))
     print(f"prefix v1: {v1}")
     print(f"prefix v2: {v2}")
 

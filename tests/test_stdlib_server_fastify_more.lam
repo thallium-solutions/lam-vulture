@@ -24,7 +24,7 @@
 # expect: callNotFound-body: oops — custom NF
 # expect: fastify-more-ok
 
-from @lam/vulture import Server, Request, Response
+from @lam/vulture import InjectResponse, Server, Request, Response
 
 go! {
     import (
@@ -95,8 +95,8 @@ func main() {
     print("hasRoute-wrongMethod: " + str(srv.hasRoute("DELETE", "/users/:id")))
 
     # ── routerPath / routerMethod ──────────────────────────
-    r1: dict[str, any] = srv.inject("GET", "/users/42")
-    h1: any = r1["headers"]
+    r1: InjectResponse = srv.inject("GET", "/users/42")
+    h1: any = r1.headers
     rp: str = ""
     rm: str = ""
     go! {
@@ -112,8 +112,8 @@ func main() {
     h0: dict[str, str] = {}
     h0["Content-Type"] = "application/json"
     h0["Host"] = "example.test"
-    r2: dict[str, any] = srv.inject("POST", "/ping?ref=one", "{\"hi\":\"there\"}", h0)
-    h2: any = r2["headers"]
+    r2: InjectResponse = srv.inject("POST", "/ping?ref=one", "{\"hi\":\"there\"}", h0)
+    h2: any = r2.headers
     isJ: str = ""
     isF: str = ""
     u: str = ""
@@ -139,8 +139,8 @@ func main() {
     print("responseTime-ok: " + rtOk)
 
     # ── useSecurityHeaders ─────────────────────────────────
-    r3: dict[str, any] = srv.inject("GET", "/users/1")
-    h3: any = r3["headers"]
+    r3: InjectResponse = srv.inject("GET", "/users/1")
+    h3: any = r3.headers
     csp: str = ""
     hsts: str = ""
     xcto: str = ""
@@ -164,8 +164,8 @@ func main() {
     print("sec-xcto: " + xcto)
 
     # Route sets its own CSP — sec hook must defer.
-    r4: dict[str, any] = srv.inject("GET", "/secure")
-    h4: any = r4["headers"]
+    r4: InjectResponse = srv.inject("GET", "/secure")
+    h4: any = r4.headers
     cspRoute: str = ""
     go! {
         if hh, ok := h4.(map[string]string); ok {
@@ -175,9 +175,9 @@ func main() {
     print("sec-preserve-custom: " + cspRoute)
 
     # ── callNotFound ───────────────────────────────────────
-    r5: dict[str, any] = srv.inject("DELETE", "/items/99")
-    statusAny: any = r5["status"]
-    bodyAny: any = r5["body"]
+    r5: InjectResponse = srv.inject("DELETE", "/items/99")
+    statusAny: any = r5.status
+    bodyAny: any = r5.body
     statusI: int = 0
     bodyS: str = ""
     go! {

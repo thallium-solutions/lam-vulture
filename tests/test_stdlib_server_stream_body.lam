@@ -23,9 +23,10 @@
 # expect: t2-body-empty: true
 # expect: t3-disk-contents: ABCDEFGHIJ
 # expect: t4-status: 413
+# expect: t5-copy-error: true
 
-from @lam/vulture import Server, Request, Response, RequestBodyReader
-from lamtime import Time
+from @lam/vulture import Server, Request, Response, RequestBodyReader, RouteOptions
+from lamerrors import Result
 from lamos import Os
 
 go! {
@@ -38,11 +39,17 @@ go! {
     )
 }
 
+func resultInt(result: Result[int]) -> int {
+    go! {
+        return result.Value.(int)
+    }
+}
+
 func bufferedHandler(req: Request, res: Response) {
     r: RequestBodyReader = req.bodyReader()
     joined: str = ""
     while true {
-        chunk: str = r.read(1024)
+        chunk: str = str(r.read(1024).unwrap())
         if chunk == "" {
             break
         }
@@ -58,14 +65,14 @@ func streamedHandler(req: Request, res: Response) {
     chunkCount: int = 0
     total: int = 0
     while true {
-        chunk: str = r.read(16)
+        chunk: str = str(r.read(16).unwrap())
         if chunk == "" {
             break
         }
         chunkCount = chunkCount + 1
         total = total + len(chunk)
     }
-    r.close()
+    _ = r.close().unwrap()
     res.json( {
         "chunks": chunkCount,
         "bytes": total,
@@ -76,17 +83,28 @@ func streamedHandler(req: Request, res: Response) {
 func copyHandler(req: Request, res: Response) {
     r: RequestBodyReader = req.bodyReader()
     dst: str = req.queryGet("dst", "/tmp/lam-upload-test.bin")
-    n: int = r.copyTo(dst)
-    r.close()
+    n: int = resultInt(r.copyTo(dst))
+    _ = r.close().unwrap()
     res.json( {"wrote": n, "path": dst})
+}
+
+func copyFailureHandler(req: Request, res: Response) {
+    reader: RequestBodyReader = req.bodyReader()
+    copied: Result[int] = reader.copyTo("/definitely/missing/lam-vulture/upload.bin")
+    res.text(str(not copied.ok()))
 }
 
 func limitedHandler(req: Request, res: Response) {
     r: RequestBodyReader = req.bodyReader()
     # Drain fully — this should hit 413 when the payload is
     # bigger than the route's body-limit cap.
-    _ = r.readAll()
-    r.close()
+    drained: Result[str] = r.readAll()
+    if not drained.ok() {
+        go! {
+            panic(drained.Error)
+        }
+    }
+    _ = r.close().unwrap()
     res.text("should-not-reach")
 }
 
@@ -113,18 +131,12 @@ func main() {
     srv: Server = Server()
 
     srv.post("/buffered", bufferedHandler)
-    srv.routeOpts("POST", "/streamed", streamedHandler, {
-        "streamBody": true,
-    })
-    srv.routeOpts("POST", "/copy", copyHandler, {
-        "streamBody": true,
-    })
-    srv.routeOpts("POST", "/limited", limitedHandler, {
-        "streamBody": true,
-        "bodyLimit": 8,
-    })
+    srv.post("/streamed", streamedHandler, RouteOptions(0, 0, true))
+    srv.post("/copy", copyHandler, RouteOptions(0, 0, true))
+    srv.post("/limited", limitedHandler, RouteOptions(8, 0, true))
+    srv.post("/copy-failure", copyFailureHandler, RouteOptions(0, 0, true))
 
-    srv.listenBackground(0)
+    _ = srv.listenBackground(0).unwrap()
     addr: str = srv.boundAddr
 
     # ── Test 1: buffered fallback — the reader just wraps body.
@@ -179,7 +191,7 @@ func main() {
     "ABCDEFGHIJ",
     )
     s3: any = r3["status"]
-    diskContents: str = Os.readFile(tmpPath)
+    diskContents: str = str(Os.readFile(tmpPath).value)
     print(f"t3-disk-contents: {diskContents}")
     if s3 == 200 {
         Os.remove(tmpPath)
@@ -195,6 +207,9 @@ func main() {
     r4: dict[str, any] = httpPost("http://" + addr + "/limited", bigPayload)
     s4: any = r4["status"]
     print("t4-status: " + str(s4))
+
+    r5: dict[str, any] = httpPost("http://" + addr + "/copy-failure", "payload")
+    print("t5-copy-error: " + str(r5["body"]))
 
     srv.close()
 }

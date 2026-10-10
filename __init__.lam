@@ -22,7 +22,7 @@
 #     # res.text(...) / res.json(...) to produce output.
 #     srv.get("/health", lambda req, res: res.text("ok"))
 #     srv.post("/echo",  lambda req, res: res.text(req.body))
-#     srv.post("/users", createUser, userSchema)  # automatic body validation
+#     srv.post("/users", createUser, userSchema, "json")  # body validation
 #
 #     # ``req.ctx`` keeps dictionary indexing while carrying cancellation,
 #     # deadlines, reasons, and inherited values through ``lamcontext.Context``.
@@ -34,7 +34,7 @@
 #     }
 #     srv.register(authPlugin)
 #
-#     srv.listen(8080)    # blocks until srv.close()
+#     _ = srv.listen(8080).unwrap()  # blocks until srv.close()
 #
 # Routing:
 #   * Exact-path: ``/foo``
@@ -53,6 +53,8 @@
 # the response body in debug mode (toggle via ``srv.debug = true``).
 
 from lamcontext import Context
+from lamerrors import Result, Error
+from lamjson import Json
 from lamschema import Schema
 
 go! {
@@ -184,6 +186,37 @@ go! {
     func lamCoerceRouteOpts(raw interface{}) *lamRouteOpts {
         if raw == nil {
             return nil
+        }
+        if typed, ok := raw.(*RouteOptions); ok && typed != nil {
+            out := &lamRouteOpts{
+                BodyLimit:        typed.BodyLimit,
+                TimeoutMs:        typed.TimeoutMs,
+                StreamBody:       typed.StreamBody,
+                PreParsing:       typed.PreParsingHook,
+                PreValidation:    typed.PreValidationHook,
+                PreHandler:       typed.PreHandlerHook,
+                PreSerialization: typed.PreSerializationHook,
+                OnSend:           typed.OnSendHook,
+                OnResponse:       typed.OnResponseHook,
+                OnError:          typed.OnErrorHook,
+                SchemaFormat:     typed.SchemaFormat,
+                OperationId:      typed.OperationId,
+                Summary:          typed.Summary,
+                Description:      typed.Description,
+                Tags:             append([]string(nil), typed.Tags...),
+                Deprecated:       typed.Deprecated,
+                Hidden:           typed.Hidden,
+                Consumes:         append([]string(nil), typed.Consumes...),
+                Produces:         append([]string(nil), typed.Produces...),
+                Meta:             map[string]interface{}{},
+            }
+            for key, value := range typed.Meta {
+                out.Meta[key] = value
+            }
+            if typed.SchemaValue != nil {
+                lamPopulateSchemaSlots(out, typed.SchemaValue)
+            }
+            return out
         }
         m, ok := raw.(map[string]interface{})
         if !ok || len(m) == 0 {
@@ -1035,26 +1068,26 @@ go! {
 class RequestBodyReader {
     #- Incremental reader over an incoming request body. Obtain one
     via ``req.bodyReader()``. Works on both streamed routes
-    (``routeOpts( {"streamBody": true})``, where the reader pulls
+    (``route(..., RouteOptions(0, 0, true))``, where the reader pulls
     chunks directly off the TCP connection) and buffered routes
     (wraps ``req.body`` in a ``strings.Reader`` so the API shape
     is uniform).
 
-    Typical shape for a large - upload handler::
+    Typical shape for a large-upload handler::
 
-    func upload(req, res) {
-        r = req.bodyReader()
-        total = 0
+    func upload(req: Request, res: Response) {
+        r: RequestBodyReader = req.bodyReader()
+        total: int = 0
         while true {
-            chunk = r.read(8192)
+            chunk: str = str(r.read(8192).unwrap())
             if chunk == "" {
                 break
             }
             total = total + len(chunk)
-            # … sink chunk to disk / network …
+            # … sink chunk to disk or network …
         }
-        r.close()
-        res.json( {"bytes": total})
+        _ = r.close().unwrap()
+        res.json({"bytes": total})
     }
 
     ``close()`` is idempotent and optional — the server drains
@@ -1062,26 +1095,27 @@ class RequestBodyReader {
     returns, so forgetting to call it won't leak FDs (but it's
     good form to call it once you're done). -#
 
-    func __init__(self, reader: any) {
+    func init(self, reader: any) {
+        # ``rawReader`` is a native ``io.Reader`` boundary populated by the
+        # HTTP dispatcher. It cannot be expressed as a Lam structural type.
         self.rawReader: any = reader
         self.closed: bool = false
         self.eof: bool = false
     }
 
-    func read(self, maxBytes: int = 8192) -> str {
-        #- Read up to ``maxBytes`` bytes. Returns an empty string
-        on EOF(and on every subsequent call). Never returns a
-        partial UTF - 8 rune on purpose — it's just a byte slice
-        cast to string, which matches ``req.body`` semantics. -  #
-        out: str = ""
+    func read(self, maxBytes: int = 8192) -> Result[str] {
+        #- Read up to ``maxBytes`` bytes. EOF is ``Ok("")``; transport,
+        limit, and invalid-reader failures are returned as ``Result.Err``. -#
         go! {
             if s.Closed || s.Eof {
-                return out
+                return LAMMERGEIER.Result.Ok("")
             }
             reader, ok := s.RawReader.(io.Reader)
             if !ok {
                 s.Eof = true
-                return out
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "RequestBodyReadError", "request body reader is unavailable", nil,
+                ))
             }
             limit := int(maxBytes)
             if limit <= 0 {
@@ -1089,102 +1123,112 @@ class RequestBodyReader {
             }
             buf := make([]byte, limit)
             n, err := reader.Read(buf)
-            if n > 0 {
-                out = string(buf[:n])
-            }
             if err == io.EOF {
                 s.Eof = true
-            } else if err != nil {
-                // Surface “http.MaxBytesError“ as a 413 panic so
-                // the existing error-handler pipeline wraps it; any
-                // other read error stops the stream and returns
-                // whatever we already captured.
+                return LAMMERGEIER.Result.Ok(string(buf[:n]))
+            }
+            if err != nil {
+                s.Eof = true
                 var mbe *http.MaxBytesError
                 if errors.As(err, &mbe) {
-                    panic(NewHttpError(413, "payload too large", nil))
+                    return LAMMERGEIER.Result.Err(NewHttpError(413, "payload too large", nil))
                 }
-                s.Eof = true
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "RequestBodyReadError", err.Error(), nil,
+                ))
             }
+            return LAMMERGEIER.Result.Ok(string(buf[:n]))
         }
-        return out
     }
 
-    func readAll(self) -> str {
-        #- Drain the reader into a single string. Equivalent to a
-        ``read`` loop
-        handy when you've opted into streaming
-        but the body turns out to be small enough to buffer. -  #
-        out: str = ""
+    func readAll(self) -> Result[str] {
+        #- Drain the remaining body. EOF is a successful empty string;
+        read and body-limit failures are explicit ``Result.Err`` values. -#
         go! {
             if s.Closed || s.Eof {
-                return out
+                return LAMMERGEIER.Result.Ok("")
             }
             reader, ok := s.RawReader.(io.Reader)
             if !ok {
                 s.Eof = true
-                return out
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "RequestBodyReadError", "request body reader is unavailable", nil,
+                ))
             }
             data, err := io.ReadAll(reader)
+            s.Eof = true
             if err != nil {
                 var mbe *http.MaxBytesError
                 if errors.As(err, &mbe) {
-                    panic(NewHttpError(413, "payload too large", nil))
+                    return LAMMERGEIER.Result.Err(NewHttpError(413, "payload too large", nil))
                 }
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "RequestBodyReadError", err.Error(), nil,
+                ))
             }
-            s.Eof = true
-            out = string(data)
+            return LAMMERGEIER.Result.Ok(string(data))
         }
-        return out
     }
 
-    func copyTo(self, path: str) -> int {
-        #- Stream the body straight to ``path`` on disk (created
-        with ``0644`` perms, truncated if it exists). Returns
-        the number of bytes written. Raises via ``HttpError``
-        on a body - limit breach
-        other IO errors return the
-        bytes written so far. -  #
-        total: int = 0
+    func copyTo(self, path: str) -> Result[int] {
+        #- Stream the remaining body to ``path``. File creation, copy,
+        close, and body-limit failures are returned without partial-success
+        sentinels. -#
         go! {
             if s.Closed || s.Eof {
-                return total
+                return LAMMERGEIER.Result.Ok(0)
             }
             reader, ok := s.RawReader.(io.Reader)
             if !ok {
                 s.Eof = true
-                return total
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "RequestBodyCopyError", "request body reader is unavailable", nil,
+                ))
             }
             f, err := os.Create(path)
             if err != nil {
-                s.Eof = true
-                return total
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "RequestBodyCopyError", err.Error(), nil,
+                ))
             }
-            defer f.Close()
-            n, err := io.Copy(f, reader)
-            total = int(n)
-            if err != nil {
-                var mbe *http.MaxBytesError
-                if errors.As(err, &mbe) {
-                    panic(NewHttpError(413, "payload too large", nil))
-                }
-            }
+            n, copyErr := io.Copy(f, reader)
+            closeErr := f.Close()
             s.Eof = true
+            if copyErr != nil {
+                var mbe *http.MaxBytesError
+                if errors.As(copyErr, &mbe) {
+                    return LAMMERGEIER.Result.Err(NewHttpError(413, "payload too large", nil))
+                }
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "RequestBodyCopyError", copyErr.Error(), nil,
+                ))
+            }
+            if closeErr != nil {
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "RequestBodyCopyError", closeErr.Error(), nil,
+                ))
+            }
+            return LAMMERGEIER.Result.Ok(int(n))
         }
-        return total
     }
 
-    func close(self) {
-        #- Release the underlying reader. Safe to call multiple
-        times. After close, ``read`` / ``readAll`` / ``copyTo``
-        all return empty / zero. -  #
+    func close(self) -> Result[bool] {
+        #- Release the underlying reader. Repeated closes are successful;
+        native close failures are returned to the caller. -#
         go! {
             if s.Closed {
-                return
+                return LAMMERGEIER.Result.Ok(true)
             }
             s.Closed = true
+            s.Eof = true
             if c, ok := s.RawReader.(io.Closer); ok {
-                _ = c.Close()
+                if err := c.Close(); err != nil {
+                    return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                        "RequestBodyCloseError", err.Error(), nil,
+                    ))
+                }
             }
+            return LAMMERGEIER.Result.Ok(true)
         }
     }
 
@@ -1196,10 +1240,9 @@ class RequestBodyReader {
 
 class Request {
     #- Incoming HTTP request. Fields are populated by the server before
-    any hook runs
-    handlers and hooks only read them. -  #
+    any hook runs; handlers and hooks only read them. -#
 
-    func __init__(self) {
+    func init(self) {
         self.method: str = ""
         self.path: str = ""
         self.body: str = ""
@@ -1235,16 +1278,17 @@ class Request {
 
     func queryGet(self, name: str, fallback: str = "") -> str {
         #- Read a query-string value with a default. Equivalent to
-        ``req.query[name] if name in req.query else fallback``. -  #
+        ``req.query[name] if name in req.query else fallback``. -#
         if name in self.query {
             return self.query[name]
         }
         return fallback
     }
 
-    func cookie(self, name: str) -> str {
-        #- Read a single cookie value from the ``Cookie`` header.
-        Returns "" if the cookie is absent. -  #
+    func cookie(self, name: str) -> Result[str] {
+        #- Parse and return one request cookie. Missing cookies and malformed
+        Cookie headers are distinct explicit failures, never empty-string
+        sentinels. -#
         go! {
             raw := ""
             for k, v := range s.Headers {
@@ -1254,41 +1298,40 @@ class Request {
                 }
             }
             if raw == "" {
-                return ""
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "CookieNotFoundError", fmt.Sprintf("cookie %q was not provided", name), nil,
+                ))
             }
-            for _, part := range strings.Split(raw, ";") {
-                kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
-                if len(kv) == 2 && kv[0] == name {
-                    return kv[1]
+            cookies, err := http.ParseCookie(raw)
+            if err != nil {
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "CookieParseError", err.Error(), nil,
+                ))
+            }
+            for _, cookie := range cookies {
+                if cookie.Name == name {
+                    return LAMMERGEIER.Result.Ok(cookie.Value)
                 }
             }
-            return ""
+            return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                "CookieNotFoundError", fmt.Sprintf("cookie %q was not provided", name), nil,
+            ))
         }
     }
 
-    func jsonBody(self) -> json {
-        #- Parse ``self.body`` as a native json value. Returns JSON null
-        on an empty or malformed body
-        use ``req.body`` for raw text. -  #
-        go! {
-            if s.Body == "" {
-                return lamJSONMust(nil)
-            }
-            parsed, err := lamJSONParse(s.Body)
-            if err != nil {
-                return lamJSONMust(nil)
-            }
-            return parsed
-        }
+    func jsonBody(self) -> Result[json] {
+        #- Parse ``self.body`` as JSON. Empty and malformed bodies return
+        ``JsonDecodeError`` through the standard unsuffixed Result API. -#
+        return Json.decode(self.body)
     }
 
     func bodyReader(self) -> RequestBodyReader {
         #- Return a :class:`RequestBodyReader` over the request body.
 
         * On a route that opted into streaming
-        (``routeOpts( {"streamBody": true})``) the reader pulls
+        (``route(..., RouteOptions(0, 0, true))``) the reader pulls
         chunks straight off the TCP connection — ``req.body``
-        is ``""`` and content - type parsers never run.
+        is ``""`` and content-type parsers never run.
         * On a regular buffered route the reader wraps
         ``req.body`` in a ``strings.Reader`` so handlers can
         use the same streaming API regardless of how the
@@ -1296,9 +1339,8 @@ class Request {
 
         Safe to call multiple times — each call hands back a
         fresh reader positioned at the start of the body.
-        Streamed reads past EOF return ``""``
-        buffered reads
-        do too, since ``strings.Reader`` honours ``io.EOF``. -  #
+        Streamed and buffered reads past EOF return ``Ok("")``, since
+        ``strings.Reader`` honours ``io.EOF``. -#
         rawReader: any = None
         go! {
             if raw := s.Ctx.Get("__lamBodyReader", nil); raw != nil {
@@ -1313,36 +1355,31 @@ class Request {
         return RequestBodyReader(rawReader)
     }
 
-    func parsedBody(self) -> any {
-        #- Parse ``self.body`` according to ``Content-Type``:
-        * ``application / json`` → native ``json``
-        * ``application / x - www - form - urlencoded`` → ``dict[str, str]``
-        * ``text / * `` → raw ``str``
-        * anything else → raw ``str`` body
-        Returns ``None`` only when JSON parsing fails. -  #
+    func parsedBody(self) -> Result[any] {
+        #- Parse ``self.body`` according to ``Content-Type``. JSON and form
+        decoding failures are explicit; text and unknown media types are
+        successful raw strings. A custom parser's cached value is returned
+        when present. -#
         go! {
-            ct := ""
-            for k, v := range s.Headers {
-                if strings.EqualFold(k, "Content-Type") {
-                    ct = v
-                    break
-                }
+            if cached := s.Ctx.Get("__parsed", nil); cached != nil {
+                return LAMMERGEIER.Result.Ok(cached)
             }
-            ctLower := strings.ToLower(ct)
+            ct := strings.ToLower(lamReadHeader(s, "Content-Type"))
             switch {
-            case strings.Contains(ctLower, "application/json"):
-                if s.Body == "" {
-                    return nil
-                }
+            case strings.Contains(ct, "application/json"):
                 parsed, err := lamJSONParse(s.Body)
                 if err != nil {
-                    return nil
+                    return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                        "BodyParseError", err.Error(), nil,
+                    ))
                 }
-                return parsed
-            case strings.Contains(ctLower, "application/x-www-form-urlencoded"):
+                return LAMMERGEIER.Result.Ok(parsed)
+            case strings.Contains(ct, "application/x-www-form-urlencoded"):
                 vals, err := url.ParseQuery(s.Body)
                 if err != nil {
-                    return map[string]string{}
+                    return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                        "BodyParseError", err.Error(), nil,
+                    ))
                 }
                 out := map[string]string{}
                 for k, vs := range vals {
@@ -1350,27 +1387,25 @@ class Request {
                         out[k] = vs[0]
                     }
                 }
-                return out
+                return LAMMERGEIER.Result.Ok(out)
             default:
-                return s.Body
+                return LAMMERGEIER.Result.Ok(s.Body)
             }
         }
     }
 
-    func signedCookie(self, name: str, secret: str) -> str {
-        #- Read ``name`` from the cookie jar and verify the HMAC sig
-        produced by ``Response.signedCookie``. Returns the original
-        value on a successful verify, or ``""`` on tamper / missing
-        cookie / mismatched secret. Constant - time compare. -  #
-        raw: str = self.cookie(name)
-        if raw == "" {
-            return ""
-        }
+    func signedCookie(self, name: str, secret: str) -> Result[str] {
+        #- Verify a cookie created by ``Response.signedCookie``. Missing,
+        malformed, tampered, and wrong-secret values are explicit failures;
+        verification remains constant-time. -#
+        raw: str = self.cookie(name)?
         go! {
             if v, ok := lamCookieVerify(raw, secret); ok {
-                return v
+                return LAMMERGEIER.Result.Ok(v)
             }
-            return ""
+            return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                "SignedCookieError", fmt.Sprintf("cookie %q has an invalid signature", name), nil,
+            ))
         }
     }
 
@@ -1411,7 +1446,7 @@ class Request {
         #- Read the *first* file uploaded under field ``name``. Returns
         ``None`` if the part isn't present or the body isn't
         multipart. The returned dict has keys ``name``, ``filename``,
-        ``contentType``, ``size``, and ``content``(raw bytes). -  #
+        ``contentType``, ``size``, and ``content`` (raw bytes). -#
         out: any = None
         go! {
             ct := ""
@@ -1442,7 +1477,7 @@ class Request {
 
     func formFiles(self, name: str) -> list[any] {
         #- Read *every* file uploaded under field ``name`` (single
-        HTML inputs with ``multiple`` produce more than one). -  #
+        HTML inputs with ``multiple`` produce more than one). -#
         out: list[any] = []
         go! {
             ct := ""
@@ -1478,13 +1513,13 @@ class Request {
     func realIP(self) -> str {
         #- Return the originating client IP, taking the server's
         ``trustProxy`` configuration into account. Falls back to
-        ``self.remoteAddr``(host part) when no trusted forwarded
+        ``self.remoteAddr`` (host part) when no trusted forwarded
         header was found.
 
-        ** Security **: only meaningful if ``Server.trustProxy(...)``
+        **Security**: only meaningful if ``Server.trustProxy(...)``
         was called with header names you actually trust. By default
         this is disabled and you'll always get the direct peer's
-        address, which is what you want for a public - facing server. -  #
+        address, which is what you want for a public-facing server. -#
         go! {
             // Trust-proxy config is stored on the request's ctx by
             // the dispatcher (no schema change to Request needed).
@@ -1504,7 +1539,7 @@ class Request {
     func realScheme(self, fallback: str = "http") -> str {
         #- Return ``"http"`` or ``"https"`` taking forwarded headers
         into account when ``trustProxy`` is enabled. Falls back to
-        ``fallback`` if no header matched. -  #
+        ``fallback`` if no header matched. -#
         go! {
             if _, ok := s.Ctx.Get("__lamTrustHeaders", nil).([]string); ok {
                 if scheme := lamForwardedScheme(s.Headers); scheme != "" {
@@ -1524,11 +1559,11 @@ class Request {
     # ─── Decorators ────────────────────────────────────────
     func dec(self, name: str) -> any {
         #- Read a decorator visible on this request. Lookup order:
-        request - level(``Server.decorateRequest``) → server - level
+        request-level (``Server.decorateRequest``) → server-level
         (``Server.decorate``). This mirrors Fastify's
-        ``request.server. < name > `` shortcut so handlers can reach
+        ``request.server.<name>`` shortcut so handlers can reach
         any scope through the request alone. Returns ``None`` if
-        the decorator was never registered. -  #
+        the decorator was never registered. -#
         go! {
             if decs, ok := s.Ctx.Get("__lamReqDecorators", nil).(map[string]interface{}); ok {
                 if v, has := decs[name]; has {
@@ -1546,7 +1581,7 @@ class Request {
 
     func hasDec(self, name: str) -> bool {
         #- ``true`` iff a decorator named ``name`` is reachable from
-        this request(request - level or server - level). -  #
+        this request (request-level or server-level). -#
         go! {
             if decs, ok := s.Ctx.Get("__lamReqDecorators", nil).(map[string]interface{}); ok {
                 if _, has := decs[name]; has {
@@ -1576,7 +1611,7 @@ class Request {
 
     func setId(self, value: str) {
         #- Assign a request ID. Anything inside the dispatcher (logger,
-        onError, onSend) reads it back via ``req.id()``. -  #
+        onError, onSend) reads it back via ``req.id()``. -#
         self.ctx.set("__lamReqId", value)
     }
 
@@ -1593,7 +1628,7 @@ class Request {
         #- Return the request's target host *without* the port,
         taken from the ``Host`` header. Returns ``""`` if the
         header is absent. Mirrors Fastify's
-        ``request.hostname``. -  #
+        ``request.hostname``. -#
         go! {
             for k, v := range s.Headers {
                 if strings.EqualFold(k, "Host") {
@@ -1606,15 +1641,15 @@ class Request {
 
     func ips(self) -> list[str] {
         #- Return the full forwarded-client chain when
-        ``trustProxy`` is enabled, oldest - first. The last entry
+        ``trustProxy`` is enabled, oldest-first. The last entry
         is always the direct peer's address (``self.remoteAddr``
-        minus the port). When trust - proxy is off, returns a
-        single - element list with just the peer. Mirrors
+        minus the port). When trust-proxy is off, returns a
+        single-element list with just the peer. Mirrors
         Fastify's ``request.ips`` property.
 
-        Example with ``X - Forwarded - For: 1.1.1.1, 2.2.2.2``:
-        * trust - proxy on → ``["1.1.1.1", "2.2.2.2", "<peer>"]``
-        * trust - proxy off → ``["<peer>"]`` -  #
+        Example with ``X-Forwarded-For: 1.1.1.1, 2.2.2.2``:
+        * trust-proxy on → ``["1.1.1.1", "2.2.2.2", "<peer>"]``
+        * trust-proxy off → ``["<peer>"]`` -#
         out: list[str] = []
         go! {
             acc := []string{}
@@ -1653,15 +1688,15 @@ class Request {
 
     func routeOptions(self) -> dict[str, any] {
         #- Return the matched route's metadata as a dict — the same
-        keys ``Server.listRoutes()`` emits(``method``, ``path``,
+        keys ``Server.listRoutes()`` emits (``method``, ``path``,
         ``summary``, ``tags``, ``meta``, ``operationId``,
         ``deprecated``, ``hidden``, ``consumes``, ``produces``).
-        Returns an empty dict when no route matched(eg static
-        mounts, 404s, or hook - short - circuited requests).
+        Returns an empty dict when no route matched (e.g. static
+        mounts, 404s, or hook-short-circuited requests).
 
         Useful for generic middleware: a tracing hook can read
         ``req.routeOptions()["operationId"]`` without the
-        handler having to plumb the value through. -  #
+        handler having to plumb the value through. -#
         out: dict[str, any] = {}
         go! {
             route, ok := s.Ctx.Get("__lamMatchedRoute", nil).(*lamRoute)
@@ -1715,9 +1750,9 @@ class Request {
         #- Unix milliseconds captured the moment the dispatcher
         first saw this request. Subtract from the current time
         inside a late hook to measure total latency, or call
-        : py: meth: `Response.elapsedTime` from the response side
-        for the same result. Returns 0 when the dispatcher
-        didn't run (eg synthetic requests). -#
+        ``Response.elapsedTime`` from the response side for the
+        same result. Returns 0 when the dispatcher didn't run
+        (e.g. for synthetic requests). -#
         go! {
             if v, ok := s.Ctx.Get("__lamReqStart", nil).(time.Time); ok {
                 return int(v.UnixMilli())
@@ -1728,9 +1763,9 @@ class Request {
 
     func routerPath(self) -> str {
         #- Pattern string of the route that matched this request, e.g.
-        `` / users /: id``. Returns ``""`` when no route matched(404
-        path, OPTIONS short - circuit, …). Mirrors Fastify's
-        ``req.routerPath``. -  #
+        ``/users/:id``. Returns ``""`` when no route matched (404
+        path, OPTIONS short-circuit, …). Mirrors Fastify's
+        ``req.routerPath``. -#
         go! {
             route, ok := s.Ctx.Get("__lamMatchedRoute", nil).(*lamRoute)
             if !ok || route == nil {
@@ -1761,11 +1796,11 @@ class Request {
 
     func is_(self, type_: str) -> bool {
         #- ``true`` iff the request's ``Content-Type`` contains
-        ``type_``(case - insensitive, substring match — matches
+        ``type_`` (case-insensitive, substring match — matching
         Fastify's ``req.is(type)`` semantics, which accepts either
         a full media type like ``"application/json"`` or a short
         form like ``"json"``). Returns ``false`` when no
-        ``Content - Type`` header is set. -  #
+        ``Content-Type`` header is set. -#
         contentType: str = self.header("Content-Type")
         if contentType == "" {
             return false
@@ -1775,12 +1810,12 @@ class Request {
 
     func url(self) -> str {
         #- Reconstruct a usable URL for this request as
-        `` < scheme >: // < host > < path > [?query]``. Honours ``trustProxy``
-        when set(forwarded scheme / host), otherwise falls back to
-        ``http`` + ``Host`` header. Useful for redirects, link
+        ``<scheme>://<host><path>[?query]``. Honours ``trustProxy``
+        when set (forwarded scheme and host); otherwise, it falls back
+        to ``http`` plus the ``Host`` header. Useful for redirects, link
         headers, and logging. Mirrors Fastify's ``req.url``
         behaviour combined with the host reconstruction that
-        ``fullUrl`` helpers expose in express - style frameworks. -  #
+        ``fullUrl`` helpers expose in Express-style frameworks. -#
         go! {
             scheme := "http"
             for k, v := range s.Headers {
@@ -1820,11 +1855,11 @@ class Request {
 }
 
 class Response {
-    #- Outgoing HTTP response. Handlers / hooks mutate this; the server
-    serialises it to the wire exactly once, after the last hook
-    runs(or early, if something called .text / .json / .send). -  #
+    #- Outgoing HTTP response. Handlers and hooks mutate this; the server
+    serialises it to the wire exactly once, after the last hook runs
+    (or early, if something called ``.text()``, ``.json()``, or ``.send()``). -#
 
-    func __init__(self) {
+    func init(self) {
         self.status: int = 200
         self.headers: dict[str, str] = {}
         self.body: str = ""
@@ -1859,7 +1894,7 @@ class Response {
 
     func code(self, n: int) -> Response {
         #- Fastify-compatible alias for ``setStatus``. Mirrors
-        ``reply.code(201).send(payload)`` in Fastify handlers. -  #
+        ``reply.code(201).send(payload)`` in Fastify handlers. -#
         self.status = n
         return self
     }
@@ -1872,14 +1907,14 @@ class Response {
     func header(self, name: str, value: str) -> Response {
         #- Fastify-style alias for ``setHeader``. Returns self so
         ``res.header("X-A", "1").header("X-B", "2").send(...)``
-        composes naturally. -  #
+        composes naturally. -#
         self.headers[name] = value
         return self
     }
 
     func type_(self, contentType: str) -> Response {
         #- Shortcut for ``setHeader("Content-Type", ct)``. Named with a
-        trailing underscore because ``type`` is a Python / Lam keyword. -  #
+        trailing underscore because ``type`` is a Python and Lam keyword. -#
         self.headers["Content-Type"] = contentType
         return self
     }
@@ -1914,7 +1949,7 @@ class Response {
 
     func send(self, body: str) -> Response {
         #- Low-level write: uses whatever Content-Type is already set,
-        or ``application / octet - stream`` if none. -  #
+        or ``application/octet-stream`` if none. -#
         self.body = body
         self.sent = true
         return self
@@ -1930,8 +1965,7 @@ class Response {
 
     func redirect(self, url: str, code: int = 302) -> Response {
         #- Issue an HTTP redirect by setting ``Location`` and the
-        response status(302 by default
-        use 301 for permanent). -  #
+        response status (302 by default; use 301 for permanent). -#
         self.status = code
         self.headers["Location"] = url
         self.body = ""
@@ -1943,22 +1977,22 @@ class Response {
         #- Attach RFC 5988 pagination headers for a paginated list
         response. Sets:
 
-        * ``X - Total - Count`` — ``total``.
-        * ``X - Pagination - Page`` — ``page``.
-        * ``X - Pagination - Per - Page`` — ``perPage``.
-        * ``X - Pagination - Total - Pages`` — ``ceil(total / perPage)``.
-        * ``Link`` — ``first`` / ``prev`` / ``next`` / ``last``
-        entries(only those that apply to the current page),
-        each of the form `` < basePath?page = N & per_page = M >
-        rel = "<role>"``.
+        * ``X-Total-Count`` — ``total``.
+        * ``X-Pagination-Page`` — ``page``.
+        * ``X-Pagination-Per-Page`` — ``perPage``.
+        * ``X-Pagination-Total-Pages`` — ``ceil(total / perPage)``.
+        * ``Link`` — ``first``, ``prev``, ``next``, and ``last``
+        entries (only those that apply to the current page),
+        each of the form
+        ``<basePath?page=N&per_page=M>; rel="<role>"``.
 
         ``basePath`` defaults to the current request's path (read
         from ``self.ctx["__lamReqPath"]`` if the dispatcher set it,
         else ``""``). Handlers can override it to generate
         absolute URLs.
 
-        Does * not * touch ``self.body`` — pair with ``res.json(...)``
-        or ``res.send(...)`` to emit the page payload. -  #
+        Does *not* touch ``self.body`` — pair with ``res.json(...)``
+        or ``res.send(...)`` to emit the page payload. -#
         if perPage <= 0 {
             perPage = 1
         }
@@ -2008,18 +2042,15 @@ class Response {
     domain: str = "", secure: bool = false, httpOnly: bool = false,
     sameSite: str = "") -> Response {
         #- Append a ``Set-Cookie`` header with the modern attribute
-        set. ``maxAge`` 0 means a session cookie
-        positive values
-        use ``Max - Age = < n > ``
-        negative values delete the cookie by
-        setting both ``Max - Age = - 1`` and ``Expires`` in the past.
+        set. ``maxAge = 0`` means a session cookie; positive values
+        use ``Max-Age=<n>``; negative values delete the cookie by
+        setting both ``Max-Age=-1`` and ``Expires`` in the past.
 
-        ``sameSite`` accepts ``"Strict"``, ``"Lax"``, or
-        ``"None"``
-        anything else(incl. the empty default) is
-        left out so the browser picks its own default. ``None``
-        without ``Secure`` is silently rejected by browsers, so
-        pass both together for cross - site cookies. -  #
+        ``sameSite`` accepts ``"Strict"``, ``"Lax"``, or ``"None"``;
+        anything else (including the empty default) is left out so the
+        browser picks its own default. ``None`` without ``Secure`` is
+        silently rejected by browsers, so pass both together for
+        cross-site cookies. -#
         go! {
             s.Headers["Set-Cookie"] = lamServerAppendCookie(
                 s.Headers["Set-Cookie"],
@@ -2031,16 +2062,15 @@ class Response {
 
     func clearCookie(self, name: str, path: str = "/", domain: str = "") -> Response {
         #- Convenience for deleting a cookie: zero value and an
-        expired ``Max - Age`` so any browser drops it immediately. -  #
+        expired ``Max-Age`` so any browser drops it immediately. -#
         return self.cookie(name, "", path, - 1, domain, false, false, "")
     }
 
     func error_(self, code: int, msg: str = "") -> Response {
         #- Send an error response with a plain-text body. ``msg`` is
-        the body
-        if empty, the canonical status text is used.
+        the body; if empty, the canonical status text is used.
         Named ``error_`` because ``error`` is a Lam alias for the
-        built - in error type. -  #
+        built-in error type. -#
         go! {
             s.Status = code
             body := msg
@@ -2057,14 +2087,14 @@ class Response {
     func signedCookie(self, name: str, value: str, secret: str, path: str = "/",
     maxAge: int = 0, domain: str = "", secure: bool = false,
     httpOnly: bool = true, sameSite: str = "Lax") -> Response {
-        #- Sign ``value`` with HMAC-SHA256(secret) and stash as a
-        ``Set - Cookie``. Read back with ``Request.signedCookie``.
+        #- Sign ``value`` with HMAC-SHA256(secret) and stash it as a
+        ``Set-Cookie`` value. Read it back with ``Request.signedCookie``.
         Tampering with either the value or the signature on the
-        wire makes the read return ``""``.
+        wire makes the read return ``Result.Err``.
 
-        Defaults are tuned for session - cookie use:
+        Defaults are tuned for session-cookie use:
         ``httpOnly = True`` and ``sameSite = "Lax"``. Pass
-        ``secure = True`` when serving over HTTPS. -  #
+        ``secure = True`` when serving over HTTPS. -#
         go! {
             sig := lamCookieSign(value, secret)
             signed := value + "." + sig
@@ -2077,15 +2107,14 @@ class Response {
     }
 
     func streamFile(self, filePath: str, contentType: str = "") -> Response {
-        #- Stream a file from disk to the client. Headers + status flush
-        first
-        the body is then copied with ``io.Copy`` so the entire
+        #- Stream a file from disk to the client. Headers and status flush
+        first; the body is then copied with ``io.Copy`` so the entire
         file never sits in memory. Falls back to a 404 if the file
         is missing.
 
-        Only works on the HTTP path(``listen`` / ``listenBackground``)
+        Only works on the HTTP path (``listen`` or ``listenBackground``);
         on the ``inject()`` path the file is loaded into ``res.body``
-        so tests can still assert against the bytes. -  #
+        so tests can still assert against the bytes. -#
         go! {
             f, err := os.Open(filePath)
             if err != nil {
@@ -2121,13 +2150,13 @@ class Response {
         }
     }
 
-    func sse(self, emitterFn: any) -> Response {
+    func sse(self, emitterFn: func(SseEmitter)) -> Response {
         #- Switch this response into Server-Sent Events mode. The
-        dispatcher writes ``Content - Type: text / event - stream``,
+        dispatcher writes ``Content-Type: text/event-stream``,
         flushes the headers, and then invokes ``emitterFn`` with
         an ``SseEmitter`` until that function returns.
 
-        ``emitterFn`` signature: ``func(emitter: SseEmitter)``. -  #
+        ``emitterFn`` signature: ``func(emitter: SseEmitter)``. -#
         self.headers["Content-Type"] = "text/event-stream"
         self.headers["Cache-Control"] = "no-cache"
         self.headers["Connection"] = "keep-alive"
@@ -2138,16 +2167,15 @@ class Response {
 
     func push(self, target: str, contentType: str = "") -> Response {
         #- Queue an HTTP/2 server push for ``target`` (e.g.
-        `` / static / app.js``). Pushes are best - effort: they only
+        ``/static/app.js``). Pushes are best-effort: they only
         fire when the underlying ``http.ResponseWriter`` implements
-        ``http.Pusher``(HTTP / 2 over TLS). Otherwise they're
+        ``http.Pusher`` (HTTP/2 over TLS). Otherwise they're
         silently dropped — the client just falls back to fetching
         the resource normally on its own.
 
-        ``contentType`` is optional
-        when non - empty it's set on
+        ``contentType`` is optional; when non-empty, it's set on
         the synthetic push request's ``Content-Type`` header so the
-        client treats the pushed bytes correctly. -  #
+        client treats the pushed bytes correctly. -#
         go! {
             // Stash pushes in a slice on the response; the dispatcher
             // walks them after WriteHeader on HTTP/2 connections.
@@ -2160,8 +2188,8 @@ class Response {
     # ─── Decorators ────────────────────────────────────────
     func dec(self, name: str) -> any {
         #- Read a response-level decorator registered with
-        ``Server.decorateReply`` / ``decorateResponse``. Returns
-        ``None`` when missing. -  #
+        ``Server.decorateReply`` or ``decorateResponse``. Returns
+        ``None`` when missing. -#
         go! {
             if decs, ok := s.Ctx["__lamRespDecorators"].(map[string]interface{}); ok {
                 if v, has := decs[name]; has {
@@ -2174,7 +2202,7 @@ class Response {
 
     func hasDec(self, name: str) -> bool {
         #- ``true`` iff a response-level decorator named ``name`` was
-        registered. -  #
+        registered. -#
         go! {
             if decs, ok := s.Ctx["__lamRespDecorators"].(map[string]interface{}); ok {
                 _, has := decs[name]
@@ -2190,8 +2218,8 @@ class Response {
         response. Returns ``""`` when the header isn't set.
         Mirrors Fastify's ``reply.getHeader(name)`` — handlers
         often reach for this to observe what earlier hooks have
-        written(eg a compression plugin checking whether the
-        encoding is already locked). -  #
+        written (e.g. a compression plugin checking whether the
+        encoding is already locked). -#
         needle: str = name.toLower()
         for key in self.headers {
             if key.toLower() == needle {
@@ -2203,9 +2231,9 @@ class Response {
 
     func getHeaders(self) -> dict[str, str] {
         #- Snapshot of every header currently set on the response.
-        Returns a * copy * so callers can mutate it without
+        Returns a *copy* so callers can mutate it without
         affecting the outgoing response. Mirrors Fastify's
-        ``reply.getHeaders()``. -  #
+        ``reply.getHeaders()``. -#
         snapshot: dict[str, str] = {}
         for key in self.headers {
             snapshot[key] = self.headers[key]
@@ -2215,7 +2243,7 @@ class Response {
 
     func hasHeader(self, name: str) -> bool {
         #- ``true`` iff a header named ``name`` (case-insensitive)
-        is set on the response. -  #
+        is set on the response. -#
         needle: str = name.toLower()
         for key in self.headers {
             if key.toLower() == needle {
@@ -2227,8 +2255,8 @@ class Response {
 
     func removeHeader(self, name: str) -> Response {
         #- Delete a header from the response (case-insensitive).
-        No - op if the header isn't set. Returns ``self`` so it
-        chains with other builder - style calls. -  #
+        No-op if the header isn't set. Returns ``self`` so it
+        chains with other builder-style calls. -#
         needle: str = name.toLower()
         for key in self.headers {
             if key.toLower() == needle {
@@ -2243,14 +2271,14 @@ class Response {
         dispatcher will not write status, headers, or body, and
         will not invoke the rest of the hook ladder
         (``onSend`` / ``onResponse``). The handler is expected
-        to take over ``self.rawWriter``(the raw
+        to take over ``self.rawWriter`` (the raw
         ``http.ResponseWriter``) itself and manage the
         connection from there.
 
-        Typical use: WebSocket upgrades, long - polling /
+        Typical use: WebSocket upgrades, long-polling or
         streaming where the handler runs its own write loop,
-        or a raw file - stream implementation. Mirrors Fastify's
-        ``reply.hijack()``. -  #
+        or a raw file-stream implementation. Mirrors Fastify's
+        ``reply.hijack()``. -#
         self.hijacked = true
         self.sent = true
         return self
@@ -2259,12 +2287,12 @@ class Response {
     func elapsedTime(self) -> int {
         #- Milliseconds since the dispatcher first saw the
         associated request. Captured at the top of
-        ``lamServerDispatch`` on ``res.ctx["__lamReqStart"]``
+        ``lamServerDispatch`` on ``res.ctx["__lamReqStart"]``;
         handlers, ``preSerialization`` hooks, and
         ``onSend`` / ``onResponse`` observers can all call this
         to attach a latency metric. Returns 0 when the
-        dispatcher didn't run (eg a plugin constructed a
-        synthetic response without going through inject). -  #
+        dispatcher didn't run (e.g. a plugin constructed a
+        synthetic response without going through inject). -#
         go! {
             if v, ok := s.Ctx["__lamReqStart"].(time.Time); ok {
                 return int(time.Since(v).Milliseconds())
@@ -2274,21 +2302,20 @@ class Response {
     }
 
     func getResponseTime(self) -> int {
-        #- Alias for :py:meth:`elapsedTime`. Included so code ported
-        from Fastify(``reply.getResponseTime()``) works
-        unchanged. -  #
+        #- Alias for ``elapsedTime``. Included so code ported from
+        Fastify (``reply.getResponseTime()``) works unchanged. -#
         return self.elapsedTime()
     }
 
     func setHeaders(self, values: dict[str, str]) -> Response {
         #- Set multiple response headers in one call. Existing headers
-        with the same(case - sensitive) name are overwritten
-        names not present in ``values`` are left untouched. Mirrors
-        Fastify's ``reply.headers({...})`` — handy for sending a
-        block of cache / security headers in a single shot. Returns
-        ``self`` so it chains with the rest of the builder API.
-        Named ``setHeaders``(not ``headers``) because the Response
-        struct already has a ``headers`` field. -  #
+        with the same (case-sensitive) name are overwritten; names not
+        present in ``values`` are left untouched. Mirrors Fastify's
+        ``reply.headers({...})`` — handy for sending a block of cache
+        and security headers in a single shot. Returns ``self`` so it
+        chains with the rest of the builder API. Named ``setHeaders``
+        (not ``headers``) because the Response struct already has a
+        ``headers`` field. -#
         for key in values {
             self.headers[key] = values[key]
         }
@@ -2300,9 +2327,9 @@ class Response {
         over to the server's ``notFoundHandler`` (or, if none is
         registered, a bare 404). Matches Fastify's
         ``reply.callNotFound()``. Flags the request so the
-        dispatcher routes through the not - found pipeline on its
+        dispatcher routes through the not-found pipeline on its
         next iteration — the calling handler should ``return``
-        straight after this call. -  #
+        straight after this call. -#
         self.ctx["__lamCallNotFound"] = true
         self.status = 404
         return self
@@ -2310,25 +2337,22 @@ class Response {
 
     func serialize(self, payload: any = None) -> str {
         #- Serialize ``payload`` (or the current body when ``payload``
-        is ``None``) into the on - the - wire string, applying the
-        matched route's response schema for the *current*
-        ``self.status`` if one is registered. Mirrors Fastify's
-        ``reply.serialize(payload)`` — useful for caching
-        pre - serialised replies, piping the body into a
-        different response, or asserting serializer behaviour
-        from inside tests.
+        is ``None``) into the on-the-wire string, applying the matched
+        route's response schema for the *current* ``self.status`` if one
+        is registered. Mirrors Fastify's ``reply.serialize(payload)`` —
+        useful for caching pre-serialised replies, piping the body into a
+        different response, or asserting serializer behaviour from tests.
 
-        Resolution order for the schema(same as the dispatcher's
-        built - in serializer): exact status code("200") → status
-        family("2xx") → ``"default"`` → no schema. When no
-        schema matches, ``payload`` is passed through
-        ``json.Marshal`` if it isn't already a string; a string
-        is returned verbatim so text handlers round - trip
-        cleanly.
+        Resolution order for the schema (same as the dispatcher's
+        built-in serializer): exact status code (``"200"``) → status
+        family (``"2xx"``) → ``"default"`` → no schema. When no
+        schema matches, ``payload`` is passed through ``json.Marshal``
+        if it isn't already a string; a string is returned verbatim so
+        text handlers round-trip cleanly.
 
-        Does ** not ** mutate the response — call
-        ``res.body = res.serialize(...)``(or ``res.json(...)``)
-        if you want the serialised form on the wire. -  #
+        Does **not** mutate the response — call
+        ``res.body = res.serialize(...)`` (or ``res.json(...)``)
+        if you want the serialised form on the wire. -#
         out: str = ""
         go! {
             var body interface{}
@@ -2391,9 +2415,9 @@ class Response {
 
 class HttpError {
     #- Typed HTTP error: throw ``HttpError`` from a hook or handler to
-    short - circuit with a structured ``application / problem + json``
+    short-circuit with a structured ``application/problem+json``
     response. Caught by the dispatcher and routed through
-    ``setErrorHandler`` / the ``onError`` chain.
+    ``setErrorHandler`` and the ``onError`` chain.
 
     ::
 
@@ -2403,9 +2427,9 @@ class HttpError {
     panic(HttpError(409, "duplicate", {"key": email}))
 
     ``data`` is serialised verbatim under the ``data`` key when
-    present — useful for surfacing field - level validation errors. -  #
+    present — useful for surfacing field-level validation errors. -#
 
-    func __init__(self, status: int, message: str = "", data: any = None) {
+    func init(self, status: int, message: str = "", data: any = None) {
         self.status: int = status
         self.message: str = message
         self.data: any = data
@@ -2457,18 +2481,16 @@ class HttpError {
 }
 
 class SseEmitter {
-    #- Wraps a ``http.ResponseWriter`` + ``http.Flusher`` and serialises
+    #- Wraps a ``http.ResponseWriter`` and ``http.Flusher`` and serialises
     events to the SSE wire format. Call ``send`` for unnamed data,
-    ``sendEvent`` for named events, ``comment`` for keep - alive
-    pings. ``done`` marks the emitter closed
-    subsequent sends
-    become no - ops.
+    ``sendEvent`` for named events, and ``comment`` for keep-alive
+    pings. ``done`` marks the emitter closed; subsequent sends
+    become no-ops.
 
-    Construct one yourself only in tests
-    the dispatcher creates one
-    and passes it to your ``func(emitter: SseEmitter)`` SSE handler. -  #
+    Construct one yourself only in tests; the dispatcher creates one
+    and passes it to your ``func(emitter: SseEmitter)`` SSE handler. -#
 
-    func __init__(self) {
+    func init(self) {
         self.writer: any = None
         self.flusher: any = None
         self.closed: bool = false
@@ -2477,7 +2499,7 @@ class SseEmitter {
     func send(self, data: str) {
         #- Emit an unnamed event: ``data: <data>\n\n``. Multi-line
         values are split into multiple ``data: `` lines per the
-        SSE spec. -  #
+        SSE spec. -#
         if self.closed {
             return
         }
@@ -2519,7 +2541,7 @@ class SseEmitter {
 
     func comment(self, text: str) {
         #- SSE comment line. Useful as a heartbeat to keep proxies from
-        idling out the connection. -  #
+        idling out the connection. -#
         if self.closed {
             return
         }
@@ -2538,28 +2560,128 @@ class SseEmitter {
     func close(self) {
         #- Mark the emitter closed; further send calls become no-ops.
         The underlying connection is released when the SSE handler
-        function returns. -  #
+        function returns. -#
         self.closed = true
+    }
+}
+
+class RouteOptions {
+    #- Typed per-route configuration used by the ``route`` and verb-helper
+    overloads. Schema values and metadata remain ``any`` because JSON Schema
+    accepts heterogeneous object trees and metadata is intentionally opaque;
+    all executable extension points are registered through typed methods. -#
+
+    func init(self, bodyLimit: int = 0, timeoutMs: int = 0, streamBody: bool = false) {
+        self.bodyLimit: int = bodyLimit
+        self.timeoutMs: int = timeoutMs
+        self.streamBody: bool = streamBody
+        self.schemaValue: any = None
+        self.schemaFormat: str = "json"
+        self.summary: str = ""
+        self.description: str = ""
+        self.operationId: str = ""
+        self.tags: list[str] = []
+        self.deprecated: bool = false
+        self.hidden: bool = false
+        self.consumes: list[str] = []
+        self.produces: list[str] = []
+        self.meta: dict[str, any] = {}
+        # Native dispatch slots are heterogeneous only because an absent hook
+        # is represented by None. Typed setters are the public write surface.
+        self.preParsingHook: any = None
+        self.preValidationHook: any = None
+        self.preHandlerHook: any = None
+        self.preSerializationHook: any = None
+        self.onSendHook: any = None
+        self.onResponseHook: any = None
+        self.onErrorHook: any = None
+    }
+
+    func withSchema(self, schema: any, format: str = "json") -> RouteOptions {
+        #- Attach the heterogeneous JSON/YAML/XML schema tree. -#
+        self.schemaValue = schema
+        self.schemaFormat = format
+        return self
+    }
+
+    func preParsing(self, hook: func(Request, Response)) -> RouteOptions {
+        self.preParsingHook = hook
+        return self
+    }
+
+    func preValidation(self, hook: func(Request, Response)) -> RouteOptions {
+        self.preValidationHook = hook
+        return self
+    }
+
+    func preHandler(self, hook: func(Request, Response)) -> RouteOptions {
+        self.preHandlerHook = hook
+        return self
+    }
+
+    func preSerialization(self, hook: func(Request, Response)) -> RouteOptions {
+        self.preSerializationHook = hook
+        return self
+    }
+
+    func onSend(self, hook: func(Request, Response)) -> RouteOptions {
+        self.onSendHook = hook
+        return self
+    }
+
+    func onResponse(self, hook: func(Request, Response)) -> RouteOptions {
+        self.onResponseHook = hook
+        return self
+    }
+
+    func onError(self, hook: func(Request, Response, any)) -> RouteOptions {
+        self.onErrorHook = hook
+        return self
+    }
+
+    func metadata(self, name: str, value: any) -> RouteOptions {
+        #- Store opaque application metadata surfaced by route introspection. -#
+        self.meta[name] = value
+        return self
+    }
+}
+
+class InjectResponse {
+    #- Typed response returned by ``Server.inject``. -#
+
+    func init(self, status: int = 200, body: str = "", headers: dict[str, str] = {}) {
+        self.status: int = status
+        self.body: str = body
+        self.headers: dict[str, str] = headers
+    }
+
+    func header(self, name: str) -> str {
+        needle: str = name.toLower()
+        for key in self.headers {
+            if key.toLower() == needle {
+                return self.headers[key]
+            }
+        }
+        return ""
     }
 }
 
 class Server {
     #- HTTP server with Fastify-style hooks and a plug-in mechanism.
 
-    Routes are registered via the method - shortcut helpers
-    (``get`` / ``post`` / …) or the generic ``route(method, path, handler)``.
+    Routes are registered via the method-shortcut helpers (``get``,
+    ``post``, …) or the generic ``route(method, path, handler)``.
     Hooks run in this order around every request:
 
-    onRequest → preHandler →[handler] → onResponse
+    onRequest → preHandler → [handler] → onResponse
 
-    Any hook can short - circuit by populating ``res``(setting the
-    body, status, or calling ``res.text()`` / ``res.json()``).
-    Downstream hooks and the route handler won't run. The final
-    ``onResponse`` ladder still executes so logging / metrics hooks
-    observe everything.
-    -  #
+    Any hook can short-circuit by populating ``res`` (setting the body
+    or status, or calling ``res.text()`` or ``res.json()``). Downstream
+    hooks and the route handler won't run. The final ``onResponse``
+    ladder still executes so logging and metrics hooks observe everything.
+    -#
 
-    func __init__(self) {
+    func init(self) {
         self.routes: list[any] = []
         self.staticMounts: list[any] = []
         # Request-lifecycle hooks. Order: onRequest → preParsing →
@@ -2649,7 +2771,7 @@ class Server {
         # handler does not return before the deadline, the dispatcher
         # writes a 408 Request Timeout (or whatever an ``onTimeout``
         # hook produced) and abandons the goroutine. Override per
-        # route via ``routeOpts({"timeoutMs": ...})``.
+        # route via the typed ``RouteOptions.timeoutMs`` field.
         self.requestTimeoutMs: int = 0
         # ``onTimeout`` hooks fire when the per-request handler
         # timeout (``requestTimeoutMs`` or per-route override) elapses
@@ -2685,19 +2807,19 @@ class Server {
     func trustProxy(self, headers: list[str] = ["X-Forwarded-For"], hops: int = 1) {
         #- Configure forwarded-IP header trust. After calling this:
 
-        * ``Request.realIP()`` walks ``headers``(in order) and
-        returns the rightmost value — i.e. the IP belonging to
-        the trusted proxy that talked to us — adjusted by ``hops``
-        (use ``hops = 2`` if there are two proxies between you and
-        the original client and you want the * original * IP).
-        * ``Request.realScheme()`` honours ``X - Forwarded - Proto``
-        and RFC 7239 ``Forwarded: proto = ...``.
-        * Plugins(e.g. ``rateLimit``) keyed on client IP follow
-        the same logic automatically.
+        * ``Request.realIP()`` walks ``headers`` (in order) and returns
+        the rightmost value — i.e. the IP belonging to the trusted proxy
+        that talked to us — adjusted by ``hops`` (use ``hops = 2`` if
+        there are two proxies between you and the original client and you
+        want the *original* IP).
+        * ``Request.realScheme()`` honours ``X-Forwarded-Proto`` and
+        RFC 7239 ``Forwarded: proto=...``.
+        * Plugins (e.g. ``rateLimit``) keyed on client IP follow the same
+        logic automatically.
 
-        ** Don't enable this unless you actually have a proxy.** A
-        public - facing server that trusts ``X - Forwarded - For`` lets
-        any client spoof any IP. -  #
+        **Don't enable this unless you actually have a proxy.** A
+        public-facing server that trusts ``X-Forwarded-For`` lets any
+        client spoof any IP. -#
         self.trustProxyHeaders = headers
         if hops < 1 {
             hops = 1
@@ -2706,29 +2828,17 @@ class Server {
     }
 
     # ─── Route registration ────────────────────────────────
-    func route(self, method: str, path: str, handler: any, schema: str | json | None = None, schemaFormat: str = "json") {
+    func route(self, method: str, path: str, handler: func(Request, Response), opts: RouteOptions) {
+        #- Typed overload for per-route limits, timeouts, streaming, hooks,
+        schemas, OpenAPI fields, and opaque metadata. -#
+        self._routeOptions(method, path, handler, opts)
+    }
+
+    func route(self, method: str, path: str, handler: func(Request, Response)) {
         go! {
             full := s.RoutePrefix + path
-            var r lamRoute
-            if schema == nil {
-                r = lamCompileRoute(method, full, handler)
-            } else {
-                if schemaFormat != "json" && schemaFormat != "yaml" && schemaFormat != "xml" {
-                    panic("SchemaFormatError: unsupported schema format " + schemaFormat)
-                }
-                opts := lamCoerceRouteOpts(map[string]interface{}{
-                    "schema":       map[string]interface{}{"body": schema},
-                    "schemaFormat": schemaFormat,
-                })
-                if schemaFormat == "json" {
-                    if _, failure := lamSchemaCompileText(opts.BodySchema); failure != nil {
-                        panic(failure.kind + ": " + failure.message)
-                    }
-                }
-                r = lamCompileRouteWithOpts(method, full, handler, opts)
-            }
+            r := lamCompileRoute(method, full, handler)
             s.Routes = append(s.Routes, r)
-            // Lazily allocate the trie on first registration.
             t, ok := s.RouteTrie.(*lamRouteTrie)
             if !ok || t == nil {
                 t = newLamRouteTrie()
@@ -2738,41 +2848,35 @@ class Server {
         }
     }
 
-    func routeOpts(self, method: str, path: str, handler: any, opts: any) {
-        #- Register a route with per-route options. ``opts`` is a
-        ``dict[str, any]`` accepting these keys:
+    func route(self, method: str, path: str, handler: func(Request, Response), schema: str | json, schemaFormat: str) {
+        #- Register a body schema directly. ``schemaFormat`` is explicit so
+        this arity remains unambiguous with the ``RouteOptions`` overload. -#
+        go! {
+            full := s.RoutePrefix + path
+            if schemaFormat != "json" && schemaFormat != "yaml" && schemaFormat != "xml" {
+                panic("SchemaFormatError: unsupported schema format " + schemaFormat)
+            }
+            opts := lamCoerceRouteOpts(map[string]interface{}{
+                "schema":       map[string]interface{}{"body": schema},
+                "schemaFormat": schemaFormat,
+            })
+            if schemaFormat == "json" {
+                if _, failure := lamSchemaCompileText(opts.BodySchema); failure != nil {
+                    panic(failure.kind + ": " + failure.message)
+                }
+            }
+            r := lamCompileRouteWithOpts(method, full, handler, opts)
+            s.Routes = append(s.Routes, r)
+            t, ok := s.RouteTrie.(*lamRouteTrie)
+            if !ok || t == nil {
+                t = newLamRouteTrie()
+                s.RouteTrie = t
+            }
+            lamTrieInsert(t, r)
+        }
+    }
 
-        * ``bodyLimit``(int) — overrides ``Server.bodyLimit`` for
-        this route only. ``413`` if exceeded.
-        * ``timeoutMs`` / ``timeout``(int) — per - request handler
-        timeout in milliseconds, overriding
-        ``Server.setRequestTimeout``. ``0`` inherits.
-        * ``streamBody`` / ``stream``(bool) — when true, skip
-        the buffered body read
-        ``req.body`` stays empty and
-        handlers pull chunks from ``req.bodyReader()``. Use
-        for large uploads or chunked ingest.
-        * ``preParsing`` / ``preValidation`` / ``preHandler`` /
-        ``preSerialization`` / ``onSend`` / ``onResponse`` /
-        ``onError``(func) — route - scoped lifecycle hooks. Run
-        *after * their global counterparts.
-        * ``schema``(dict) — JSON Schema for body / querystring
-        / params / headers / response. Each leaf may be a
-        JSON - Schema string or a Lam dict
-        the dispatcher
-        compiles them lazily.
-        * ``summary`` / ``description`` / ``operationId``(str)
-        — OpenAPI metadata.
-        * ``tags``(list[str]) — categorisation tags.
-        * ``deprecated``(bool) — marks the route deprecated in
-        ``listRoutes`` and the OpenAPI generator.
-        * ``hidden``(bool) — hides the route from ``listRoutes``
-        and OpenAPI output.
-        * ``consumes`` / ``produces``(list[str]) — OpenAPI media
-        types accepted / returned.
-
-        Anything not recognised lands in ``opts.meta`` and is
-        echoed back by ``listRoutes``. -  #
+    func _routeOptions(self, method: str, path: str, handler: func(Request, Response), opts: RouteOptions) {
         go! {
             full := s.RoutePrefix + path
             optsTyped := lamCoerceRouteOpts(opts)
@@ -2787,38 +2891,114 @@ class Server {
         }
     }
 
-    func get(self, path: str, handler: any, schema: str | json | None = None, schemaFormat: str = "json") {
+    func get(self, path: str, handler: func(Request, Response)) {
+        self.route("GET", path, handler)
+    }
+
+    func post(self, path: str, handler: func(Request, Response)) {
+        self.route("POST", path, handler)
+    }
+
+    func put(self, path: str, handler: func(Request, Response)) {
+        self.route("PUT", path, handler)
+    }
+
+    func del(self, path: str, handler: func(Request, Response)) {
+        self.route("DELETE", path, handler)
+    }
+
+    func patch(self, path: str, handler: func(Request, Response)) {
+        self.route("PATCH", path, handler)
+    }
+
+    func head(self, path: str, handler: func(Request, Response)) {
+        self.route("HEAD", path, handler)
+    }
+
+    func options(self, path: str, handler: func(Request, Response)) {
+        self.route("OPTIONS", path, handler)
+    }
+
+    func all(self, path: str, handler: func(Request, Response)) {
+        self.route("GET", path, handler)
+        self.route("POST", path, handler)
+        self.route("PUT", path, handler)
+        self.route("DELETE", path, handler)
+        self.route("PATCH", path, handler)
+        self.route("HEAD", path, handler)
+        self.route("OPTIONS", path, handler)
+    }
+
+    func get(self, path: str, handler: func(Request, Response), opts: RouteOptions) {
+        self._routeOptions("GET", path, handler, opts)
+    }
+
+    func post(self, path: str, handler: func(Request, Response), opts: RouteOptions) {
+        self._routeOptions("POST", path, handler, opts)
+    }
+
+    func put(self, path: str, handler: func(Request, Response), opts: RouteOptions) {
+        self._routeOptions("PUT", path, handler, opts)
+    }
+
+    func del(self, path: str, handler: func(Request, Response), opts: RouteOptions) {
+        self._routeOptions("DELETE", path, handler, opts)
+    }
+
+    func patch(self, path: str, handler: func(Request, Response), opts: RouteOptions) {
+        self._routeOptions("PATCH", path, handler, opts)
+    }
+
+    func head(self, path: str, handler: func(Request, Response), opts: RouteOptions) {
+        self._routeOptions("HEAD", path, handler, opts)
+    }
+
+    func options(self, path: str, handler: func(Request, Response), opts: RouteOptions) {
+        self._routeOptions("OPTIONS", path, handler, opts)
+    }
+
+    func all(self, path: str, handler: func(Request, Response), opts: RouteOptions) {
+        self._routeOptions("GET", path, handler, opts)
+        self._routeOptions("POST", path, handler, opts)
+        self._routeOptions("PUT", path, handler, opts)
+        self._routeOptions("DELETE", path, handler, opts)
+        self._routeOptions("PATCH", path, handler, opts)
+        self._routeOptions("HEAD", path, handler, opts)
+        self._routeOptions("OPTIONS", path, handler, opts)
+    }
+
+    func get(self, path: str, handler: func(Request, Response), schema: str | json, schemaFormat: str) {
         self.route("GET", path, handler, schema, schemaFormat)
     }
 
-    func post(self, path: str, handler: any, schema: str | json | None = None, schemaFormat: str = "json") {
+    func post(self, path: str, handler: func(Request, Response), schema: str | json, schemaFormat: str) {
         self.route("POST", path, handler, schema, schemaFormat)
     }
 
-    func put(self, path: str, handler: any, schema: str | json | None = None, schemaFormat: str = "json") {
+    func put(self, path: str, handler: func(Request, Response), schema: str | json, schemaFormat: str) {
         self.route("PUT", path, handler, schema, schemaFormat)
     }
 
-    func del(self, path: str, handler: any, schema: str | json | None = None, schemaFormat: str = "json") {
+    func del(self, path: str, handler: func(Request, Response), schema: str | json, schemaFormat: str) {
         #- Named ``del`` because ``delete`` is a Go builtin. -#
         self.route("DELETE", path, handler, schema, schemaFormat)
     }
 
-    func patch(self, path: str, handler: any, schema: str | json | None = None, schemaFormat: str = "json") {
+    func patch(self, path: str, handler: func(Request, Response), schema: str | json, schemaFormat: str) {
         self.route("PATCH", path, handler, schema, schemaFormat)
     }
 
-    func head(self, path: str, handler: any, schema: str | json | None = None, schemaFormat: str = "json") {
+    func head(self, path: str, handler: func(Request, Response), schema: str | json, schemaFormat: str) {
         self.route("HEAD", path, handler, schema, schemaFormat)
     }
 
-    func options(self, path: str, handler: any, schema: str | json | None = None, schemaFormat: str = "json") {
+    func options(self, path: str, handler: func(Request, Response), schema: str | json, schemaFormat: str) {
         self.route("OPTIONS", path, handler, schema, schemaFormat)
     }
 
-    func all(self, path: str, handler: any, schema: str | json | None = None, schemaFormat: str = "json") {
+    func all(self, path: str, handler: func(Request, Response), schema: str | json, schemaFormat: str) {
         #- Register the same handler for every common HTTP verb. Useful
-        for catch - all health - check / fallback endpoints. -  #
+        for catch-all health-check or fallback endpoints. -#
         self.route("GET", path, handler, schema, schemaFormat)
         self.route("POST", path, handler, schema, schemaFormat)
         self.route("PUT", path, handler, schema, schemaFormat)
@@ -2828,37 +3008,9 @@ class Server {
         self.route("OPTIONS", path, handler, schema, schemaFormat)
     }
 
-    func getOpts(self, path: str, handler: any, opts: any) {
-        self.routeOpts("GET", path, handler, opts)
-    }
-
-    func postOpts(self, path: str, handler: any, opts: any) {
-        self.routeOpts("POST", path, handler, opts)
-    }
-
-    func putOpts(self, path: str, handler: any, opts: any) {
-        self.routeOpts("PUT", path, handler, opts)
-    }
-
-    func delOpts(self, path: str, handler: any, opts: any) {
-        self.routeOpts("DELETE", path, handler, opts)
-    }
-
-    func patchOpts(self, path: str, handler: any, opts: any) {
-        self.routeOpts("PATCH", path, handler, opts)
-    }
-
-    func headOpts(self, path: str, handler: any, opts: any) {
-        self.routeOpts("HEAD", path, handler, opts)
-    }
-
-    func optionsOpts(self, path: str, handler: any, opts: any) {
-        self.routeOpts("OPTIONS", path, handler, opts)
-    }
-
-    func notFound(self, handler: any) {
+    func notFound(self, handler: func(Request, Response)) {
         #- Register a handler for paths that match no route.
-        Signature is the same as any other handler. -  #
+        Signature is the same as any other handler. -#
         self.notFoundHandler = handler
     }
 
@@ -2876,68 +3028,67 @@ class Server {
     #                    headers/body are final here
     #   onResponse     → observational; body/status are locked in
     #   onError        → only fires on panic in any of the above
-    func onRequest(self, hook: any) {
+    func onRequest(self, hook: func(Request, Response)) {
         #- Hook signature: ``func(req: Request, res: Response)``. -#
         self.onRequestHooks.append(hook)
     }
 
-    func preParsing(self, hook: any) {
+    func preParsing(self, hook: func(Request, Response)) {
         #- Runs before the dispatcher invokes any content-type
-        parser. Useful for rewriting bodies(eg Brotli - decoded
-        uploads) or short - circuiting on inspected headers. -  #
+        parser. Useful for rewriting bodies (e.g. Brotli-decoded
+        uploads) or short-circuiting on inspected headers. -#
         self.preParsingHooks.append(hook)
     }
 
-    func preValidation(self, hook: any) {
+    func preValidation(self, hook: func(Request, Response)) {
         #- Runs after parsing, before schema validation kicks in.
-        Mutating ``req.body`` / ``req.query`` / ``req.params`` /
-        ``req.headers`` here is honoured by the validator. -  #
+        Mutating ``req.body``, ``req.query``, ``req.params``, or
+        ``req.headers`` here is honoured by the validator. -#
         self.preValidationHooks.append(hook)
     }
 
-    func preHandler(self, hook: any) {
+    func preHandler(self, hook: func(Request, Response)) {
         self.preHandlerHooks.append(hook)
     }
 
-    func preSerialization(self, hook: any) {
+    func preSerialization(self, hook: func(Request, Response)) {
         #- Fires after the handler returns, before the response body
-        is serialised(``res.body``). Mutating the body here is
-        honoured by the serializer. -  #
+        (``res.body``) is serialised. Mutating the body here is
+        honoured by the serializer. -#
         self.preSerializationHooks.append(hook)
     }
 
-    func onSend(self, hook: any) {
+    func onSend(self, hook: func(Request, Response)) {
         #- Last hook before the response leaves the server. Headers,
-        status and body are all final — mutate with care. -  #
+        status and body are all final — mutate with care. -#
         self.onSendHooks.append(hook)
     }
 
-    func onResponse(self, hook: any) {
+    func onResponse(self, hook: func(Request, Response)) {
         self.onResponseHooks.append(hook)
     }
 
-    func onError(self, hook: any) {
+    func onError(self, hook: func(Request, Response, any)) {
         #- Register an error hook. Hook signature is
         ``func(req: Request, res: Response, errMsg: any)``.
-        Every registered hook is invoked when a handler / hook
-        panics
-        mutate ``res`` to control the response. If no
-        hook calls ``res.text / .json / .send``, a generic 500 is
-        emitted as a fallback. -  #
+        Every registered hook is invoked when a handler or hook
+        panics; mutate ``res`` to control the response. If no hook
+        calls ``res.text()``, ``res.json()``, or ``res.send()``, a
+        generic 500 is emitted as a fallback. -#
         self.onErrorHooks.append(hook)
     }
 
-    func setErrorHandler(self, handler: any) {
+    func setErrorHandler(self, handler: func(any, Request, Response)) {
         #- Install a *single* central error handler, Fastify-style.
         Signature: ``func(err: any, req: Request, res: Response)``.
-        The handler owns the response shape when a panic occurs
-        ``onError`` hooks still fire first(for logs / metrics) but
+        The handler owns the response shape when a panic occurs;
+        ``onError`` hooks still fire first (for logs and metrics), but
         the handler decides the wire output. Only one handler may
-        be active — calling this replaces any prior handler. -  #
+        be active — calling this replaces any prior handler. -#
         self.errorHandler = handler
     }
 
-    func setNotFoundHandler(self, handler: any) {
+    func setNotFoundHandler(self, handler: func(Request, Response)) {
         #- Fastify-compatible alias for ``notFound``. -#
         self.notFoundHandler = handler
     }
@@ -2947,21 +3098,21 @@ class Server {
     # acquiring / releasing resources (DB pools, Redis, external
     # services). Panics inside these hooks are swallowed with a log
     # line rather than killing the process.
-    func onReady(self, hook: any) {
+    func onReady(self, hook: func(Server)) {
         #- Runs synchronously just before ``listen()`` binds. -#
         self.onReadyHooks.append(hook)
     }
 
-    func onListen(self, hook: any) {
+    func onListen(self, hook: func(Server)) {
         #- Runs *after* ``listen()`` successfully binds the socket.
         The only callback point where ``srv.boundAddr()`` is
-        guaranteed populated(for ``: 0`` ephemeral ports). -  #
+        guaranteed populated (for ``:0`` ephemeral ports). -#
         self.onListenHooks.append(hook)
     }
 
-    func onClose(self, hook: any) {
-        #- Runs during ``close()`` / ``shutdown()``, in reverse
-        registration order(teardown is the mirror of setup). -  #
+    func onClose(self, hook: func(Server)) {
+        #- Runs during ``close()`` or ``shutdown()``, in reverse
+        registration order (teardown is the mirror of setup). -#
         self.onCloseHooks.append(hook)
     }
 
@@ -2974,14 +3125,14 @@ class Server {
     func decorate(self, name: str, value: any) {
         #- Attach ``value`` to the server; read back with
         ``srv.dec(name)``. Common uses: database handles, JWT
-        verifiers, feature - flag resolvers, shared caches. -  #
+        verifiers, feature-flag resolvers, shared caches. -#
         self.decorators[name] = value
     }
 
     func decorateRequest(self, name: str, value: any) {
         #- Attach ``value`` to every incoming request. Handlers read
-        with ``req.dec(name)``. Typical: request - ID factories,
-        locale resolvers, per - request audit logger. -  #
+        with ``req.dec(name)``. Typical: request-ID factories,
+        locale resolvers, per-request audit loggers. -#
         self.requestDecorators[name] = value
     }
 
@@ -2993,13 +3144,13 @@ class Server {
     func decorateResponse(self, name: str, value: any) {
         #- Attach ``value`` to every outgoing response; handlers read
         with ``res.dec(name)``. Typical: reply helpers, redirect
-        builders, structured - error serializers. -  #
+        builders, structured-error serializers. -#
         self.replyDecorators[name] = value
     }
 
     func dec(self, name: str) -> any {
         #- Read back a server-level decorator. Returns ``None`` if
-        the name was never registered. -  #
+        the name was never registered. -#
         if name in self.decorators {
             return self.decorators[name]
         }
@@ -3012,18 +3163,16 @@ class Server {
     }
 
     # ─── Content-type parsers ──────────────────────────────
-    func addContentTypeParser(self, mediaType: str, parser: any) {
+    func addContentTypeParser(self, mediaType: str, parser: func(Request) -> any) {
         #- Register a parser for ``mediaType``. Signature:
         ``func(req: Request) -> any``. The result is cached on
-        ``req.ctx["__parsed"]`` and exposed via
-        ``req.parsedBody()``. ``mediaType`` is case - insensitive
-        and may omit parameters(eg ``application / json`` matches
-        ``application / json
-        charset = utf - 8``). Built - ins for
-        ``application / json``, ``text / plain`` and
-        ``application / x - www - form - urlencoded`` are registered
-        implicitly
-        registering an override wins. -  #
+        ``req.ctx["__parsed"]`` and exposed via ``req.parsedBody()``.
+        ``mediaType`` is case-insensitive and may omit parameters
+        (e.g. ``application/json`` matches
+        ``application/json; charset=utf-8``). Built-ins for
+        ``application/json``, ``text/plain``, and
+        ``application/x-www-form-urlencoded`` are registered implicitly;
+        registering an override wins. -#
         go! {
             key := strings.ToLower(strings.TrimSpace(mediaType))
             // Strip parameters: “application/json; charset=utf-8“
@@ -3039,7 +3188,7 @@ class Server {
     func addSchema(self, schema: any) {
         #- Register a shared JSON Schema so route schemas can
         reference it by ``$ref``. ``schema`` may be a dict with
-        a top - level ``$id`` key, a ``(id, schema)`` 2 - tuple, or
+        a top-level ``$id`` key, a ``(id, schema)`` 2-tuple, or
         a raw JSON string whose first object carries the
         ``$id``. Matching Fastify's ``fastify.addSchema(...)``:
 
@@ -3051,20 +3200,19 @@ class Server {
             "format": "date-time",
         })
 
-        srv.postOpts("/events", createEvent, {
-            "body": {
+        eventOptions: RouteOptions = RouteOptions()
+        eventOptions.withSchema({"body": {
                 "type": "object",
                 "properties": {
                     "createdAt": {"$ref": "timestamp"},
                 },
-            },
-        })
+            }})
+        srv.post("/events", createEvent, eventOptions)
 
-        Re - registering the same ``$id`` replaces the previous
-        schema
-        this is how tests typically reset between
-        cases. An empty / missing ``$id`` is a no - op so
-        handlers can pass through data defensively. -  #
+        Re-registering the same ``$id`` replaces the previous schema;
+        this is how tests typically reset between cases. An empty or
+        missing ``$id`` is a no-op so handlers can pass through data
+        defensively. -#
         go! {
             text := ""
             id := ""
@@ -3094,39 +3242,41 @@ class Server {
 
     func removeSchema(self, id: str) {
         #- Forget a previously-registered shared schema. Routes
-        that still reference it will fail compile on the next
-        request(and surface a 400 via the regular validation
-        path). -  #
+        that still reference it will fail compilation on the next
+        request (and surface a 400 via the regular validation path). -#
         if id in self.sharedSchemas {
             del self.sharedSchemas[id]
         }
     }
 
-    func setSchemaErrorFormatter(self, fn: any) {
+    func setSchemaErrorFormatter(self, fn: func(str, list[str], Request) -> any) {
         #- Install a custom formatter for schema-validation
         failures. Signature:
 
         ``func(where: str, errs: list[str], req: Request) -> any``
 
         where ``where`` is one of ``"body"``, ``"querystring"``,
-        ``"params"``, ``"headers"``(matching the location that
-        failed), ``errs`` is the list of gojsonschema error
-        strings, and ``req`` is the incoming request.
+        ``"params"``, or ``"headers"`` (matching the location that
+        failed); ``errs`` is the list of gojsonschema error strings;
+        and ``req`` is the incoming request.
 
         The return value shapes the 400 response body:
-        * a ``dict[str, any]`` → serialised as JSON(mirrors
-        Fastify's default structure)
-        * a ``str`` → sent verbatim with ``Content - Type:
-        text / plain``
-        * anything else → treated as opaque
-        ``fmt.Sprintf``
-        renders it
+        * a ``dict[str, any]`` → serialised as JSON (mirrors Fastify's
+        default structure)
+        * a ``str`` → sent verbatim with ``Content-Type: text/plain``
+        * anything else → treated as opaque; ``fmt.Sprintf`` renders it
 
-        Pass ``None`` to restore the built - in envelope. -  #
+        Pass ``None`` to restore the built-in envelope. -#
         self.schemaErrorFormatter = fn
     }
 
-    func onRequestAbort(self, hook: any) {
+    func clearSchemaErrorFormatter(self) {
+        #- Restore the built-in schema-validation error envelope. A ``None``
+        overload is not representable by Lam 1.18's function-type lowering. -#
+        self.schemaErrorFormatter = None
+    }
+
+    func onRequestAbort(self, hook: func(Request)) {
         #- Register a hook fired when the HTTP client disconnects
         before the handler finished writing. Signature:
         ``func(req: Request)``. Multiple hooks run in
@@ -3134,10 +3284,10 @@ class Server {
         with a log line so one misbehaving observer can't take
         the listener down.
 
-        The hook runs on a * separate goroutine * from the
-        handler — it can race with handler completion. Use it
-        to cancel context / close DB sessions / stop background
-        goroutines keyed off the request, not to mutate the
+        The hook runs on a *separate goroutine* from the handler —
+        it can race with handler completion. Use it to cancel contexts,
+        close DB sessions, or stop background goroutines keyed off the
+        request, not to mutate the
         response. The inject path never triggers this hook
         (there's no network peer to drop the connection). -#
         self.onRequestAbortHooks.append(hook)
@@ -3145,46 +3295,41 @@ class Server {
 
     func setRequestTimeout(self, timeoutMs: int) {
         #- Set the *default* per-request handler timeout, in
-        milliseconds. Pass ``0`` to disable. Per - route override:
-        ``srv.routeOpts(method, path, handler, {"timeoutMs": ms})``.
+        milliseconds. Pass ``0`` to disable. Per-route override:
+        ``srv.route(method, path, handler, RouteOptions(0, ms))``.
 
         When the deadline elapses before the handler returns:
 
         1. Every ``onTimeout`` hook runs in registration order.
-        2. If the response is still un - sent, the dispatcher
-        writes a ``408 Request Timeout``(or whatever the
-        hooks produced) with an ``application / json`` body
-        `` {
-            "statusCode": 408, "error": "Request Timeout",
-            "message": "..."
-        }
-        `` — same envelope as ``HttpError``.
-        3. The handler goroutine is * not * killed(Go can't
-        force - cancel a goroutine), but its eventual return
-        is ignored. Co - operative handlers that observe
-        ``req.rawHttp.Context().Done()`` exit cleanly. -  #
+        2. If the response is still unsent, the dispatcher writes a
+        ``408 Request Timeout`` (or whatever the hooks produced) with an
+        ``application/json`` body: ``{"statusCode": 408,
+        "error": "Request Timeout", "message": "..."}`` — the same
+        envelope as ``HttpError``.
+        3. The handler goroutine is *not* killed (Go can't force-cancel a
+        goroutine), but its eventual return is ignored. Cooperative
+        handlers that observe ``req.rawHttp.Context().Done()`` exit cleanly. -#
         if timeoutMs < 0 {
             timeoutMs = 0
         }
         self.requestTimeoutMs = timeoutMs
     }
 
-    func onTimeout(self, hook: any) {
+    func onTimeout(self, hook: func(Request, Response)) {
         #- Register a hook fired when a per-request timeout elapses.
         Signature: ``func(req: Request, res: Response)``. Hooks
         run sequentially on a watcher goroutine and may mutate
-        the response(status, headers, body) before it goes on
-        the wire. Panics inside a hook are recovered. -  #
+        the response (status, headers, body) before it goes on
+        the wire. Panics inside a hook are recovered. -#
         self.onTimeoutHooks.append(hook)
     }
 
     # ─── Static files ──────────────────────────────────────
     func static_(self, urlPrefix: str, dir: str) {
         #- Serve files from ``dir`` under ``urlPrefix``. Trailing
-        slashes are normalised. Path - traversal attempts(``.. / ``)
-        return 403. ``dir`` may be relative
-        it is evaluated
-        against the working directory of the server process. -  #
+        slashes are normalised. Path-traversal attempts (``../``)
+        return 403. ``dir`` may be relative; it is evaluated against
+        the working directory of the server process. -#
         go! {
             mount := [2]string{urlPrefix, dir}
             s.StaticMounts = append(s.StaticMounts, mount)
@@ -3192,14 +3337,14 @@ class Server {
     }
 
     # ─── Versioned routing ────────────────────────────────
-    func versionedRoute(self, method: str, path: str, handlers: dict[str, any], fallback: str = "", header: str = "Accept-Version") {
+    func versionedRoute(self, method: str, path: str, handlers: dict[str, func(Request, Response)], fallback: str = "", header: str = "Accept-Version") {
         #- Register a single route that dispatches to one of several
         handlers based on a request header's value. ``handlers``
-        maps a version label("v1", "v2", …) to a handler
+        maps a version label (``"v1"``, ``"v2"``, …) to a handler
         ``func(req: Request, res: Response)``.
 
         Resolution:
-        1. Read ``header`` from the request(case - insensitive).
+        1. Read ``header`` from the request (case-insensitive).
         2. If the header's value matches a key in ``handlers``,
         use that handler.
         3. Else if ``fallback`` is set and matches a key, use
@@ -3207,14 +3352,15 @@ class Server {
         4. Else reply with 406 Not Acceptable.
 
         The matched version is stashed on ``req.ctx["__lamApiVersion"]``
-        so downstream hooks(logging, metrics) can tag it.
+        so downstream hooks (logging and metrics) can tag it.
 
-        Pairs naturally with path - based versioning via
-        ``srv.register(pluginV1, "/v1", true)`` — use whichever
-        style your clients expect
-        this helper covers the
-        header style. -  #
-        dispatcher: any = None
+        Pairs naturally with path-based versioning via
+        ``srv.register(pluginV1, "/v1", true)`` — use whichever style
+        your clients expect; this helper covers the header style. -#
+        dispatcher: func(Request, Response) = lambda(_req: Request, _res: Response) -> None {
+            _ = _req
+            _ = _res
+        }
         go! {
             dispatcher = func(req *Request, res *Response) {
                 want := ""
@@ -3247,42 +3393,34 @@ class Server {
                     return
                 }
                 req.Ctx.Set("__lamApiVersion", want)
-                if fn, ok := chosen.(func(*Request, *Response)); ok {
-                    fn(req, res)
-                }
+                chosen(req, res)
             }
         }
         self.route(method, path, dispatcher)
     }
 
     # ─── Plugin registration ───────────────────────────────
-    func register(self, plugin: any, prefix: str = "", encapsulate: bool = false) {
+    func register(self, plugin: func(Server), prefix: str = "", encapsulate: bool = false) {
         #- Run a plugin synchronously. A plugin is
         ``func(srv: Server) -> None`` — it configures the server
         (adding routes, hooks, helpers) and returns.
 
-        If ``prefix`` is non - empty, every route the plugin
-        registers is mounted under that prefix
-        nested
+        If ``prefix`` is non-empty, every route the plugin registers
+        is mounted under that prefix; nested
         ``register(..., prefix = ...)`` calls compose.
 
-        If ``encapsulate`` is ``true``, request - lifecycle hooks
-        added inside the plugin become * scoped * to the plugin's
-        routes only — sibling plugins don't observe them. This
-        mirrors Fastify's encapsulation contract. Decorators and
-        ``onReady`` / ``onListen`` / ``onClose`` hooks remain
-        global(Fastify's behaviour matches). -#
+        If ``encapsulate`` is ``true``, request-lifecycle hooks added
+        inside the plugin become *scoped* to the plugin's routes only —
+        sibling plugins don't observe them. This mirrors Fastify's
+        encapsulation contract. Decorators and ``onReady``, ``onListen``,
+        and ``onClose`` hooks remain global (matching Fastify's behaviour). -#
         go! {
             oldPrefix := s.RoutePrefix
             s.RoutePrefix = oldPrefix + prefix
             defer func() { s.RoutePrefix = oldPrefix }()
 
             if !encapsulate {
-                if fn, ok := plugin.(func(*Server)); ok {
-                    fn(s)
-                } else {
-                    panic("Server.register: plugin must be func(Server) -> None")
-                }
+                plugin(s)
                 return
             }
 
@@ -3324,11 +3462,7 @@ class Server {
             }
             routesBefore := len(s.Routes)
 
-            if fn, ok := plugin.(func(*Server)); ok {
-                fn(s)
-            } else {
-                panic("Server.register: plugin must be func(Server) -> None")
-            }
+            plugin(s)
 
             // For each new hook that was added, attach it to every
             // route the plugin registered, then truncate the
@@ -3365,40 +3499,42 @@ class Server {
         }
     }
 
-    func useCors(self, origin: str = "*", methods: str = "GET, POST, PUT, DELETE, PATCH, OPTIONS", headers: str = "Content-Type, Authorization") {
-        #- Enable CORS: inject ``Access-Control-Allow-*`` headers on
-        every response and short - circuit ``OPTIONS`` preflight
-        requests with a 204. Call this once during setup. -  #
-        go! {
-            // Headers on every response.
-            s.OnResponseHooks = append(s.OnResponseHooks, func(req *Request, res *Response) {
-                if res.Headers == nil {
-                    res.Headers = map[string]string{}
-                }
-                res.Headers["Access-Control-Allow-Origin"] = origin
-                res.Headers["Access-Control-Allow-Methods"] = methods
-                res.Headers["Access-Control-Allow-Headers"] = headers
-            })
-            // Preflight short-circuit (prepended so it runs first).
-            preflight := func(req *Request, res *Response) {
-                if req.Method == "OPTIONS" {
-                    res.Status = 204
-                    res.Sent = true
-                }
-            }
-            s.OnRequestHooks = append([]interface{}{preflight}, s.OnRequestHooks...)
+    func _applyCorsHeaders(self, req: Request, res: Response, origin: str, methods: str, headers: str) {
+        _ = req
+        res.setHeader("Access-Control-Allow-Origin", origin)
+        res.setHeader("Access-Control-Allow-Methods", methods)
+        res.setHeader("Access-Control-Allow-Headers", headers)
+    }
+
+    func _applyCorsPreflight(self, req: Request, res: Response) {
+        if req.method == "OPTIONS" {
+            res.status = 204
+            res.sent = true
         }
+    }
+
+    func useCors(self, origin: str = "*", methods: str = "GET, POST, PUT, DELETE, PATCH, OPTIONS", headers: str = "Content-Type, Authorization") {
+        #- Enable CORS without crossing into native Go: response headers are
+        appended normally and the preflight hook is prepended. -#
+        responseHook: func(Request, Response) = lambda(req: Request, res: Response) -> None {
+            self._applyCorsHeaders(req, res, origin, methods, headers)
+        }
+        preflightHook: func(Request, Response) = lambda(req: Request, res: Response) -> None {
+            self._applyCorsPreflight(req, res)
+        }
+        self.onResponseHooks.append(responseHook)
+        hooks: list[any] = [preflightHook]
+        hooks.extend(self.onRequestHooks)
+        self.onRequestHooks = hooks
     }
 
     func useSecurityHeaders(self, opts: dict[str, any] = {}) {
         #- Attach Helmet-style security headers to every response.
         The defaults match what ``helmet`` ships in the Node
         ecosystem: strict transport security, no MIME sniff, a
-        frame - ancestors lock, referrer minimisation, a
-        conservative CSP, and cross - origin isolation. All values
-        are overridable via ``opts``
-        pass an empty string to
-        disable a specific header:
+        frame-ancestors lock, referrer minimisation, a conservative
+        CSP, and cross-origin isolation. All values are overridable
+        via ``opts``; pass an empty string to disable a specific header:
 
         srv.useSecurityHeaders( {
             "contentSecurityPolicy": "default-src 'self'; img-src *",
@@ -3407,26 +3543,28 @@ class Server {
             "referrerPolicy": "strict-origin",
         })
 
-        Recognised keys: ``contentSecurityPolicy``(str),
-        ``hstsMaxAge``(int, seconds
-        0 disables),
-        ``hstsIncludeSubDomains``(bool),
-        ``xContentTypeOptions``(str, default ``"nosniff"``),
-        ``xFrameOptions``(str, default ``"DENY"``),
-        ``referrerPolicy``(str, default ``"no-referrer"``),
-        ``crossOriginOpenerPolicy``(str, default ``"same-origin"``),
-        ``crossOriginResourcePolicy``(str, default ``"same-origin"``),
-        ``xDnsPrefetchControl``(str, default ``"off"``),
-        ``xDownloadOptions``(str, default ``"noopen"``),
-        ``xPermittedCrossDomainPolicies``(str, default ``"none"``),
-        ``originAgentCluster``(str, default ``"?1"``),
-        ``permissionsPolicy``(str, empty by default — set to
-        enable feature - policy opt - outs). -  #
+        Recognised keys: ``contentSecurityPolicy`` (str),
+        ``hstsMaxAge`` (int, seconds; 0 disables),
+        ``hstsIncludeSubDomains`` (bool),
+        ``xContentTypeOptions`` (str, default ``"nosniff"``),
+        ``xFrameOptions`` (str, default ``"DENY"``),
+        ``referrerPolicy`` (str, default ``"no-referrer"``),
+        ``crossOriginOpenerPolicy`` (str, default ``"same-origin"``),
+        ``crossOriginResourcePolicy`` (str, default ``"same-origin"``),
+        ``xDnsPrefetchControl`` (str, default ``"off"``),
+        ``xDownloadOptions`` (str, default ``"noopen"``),
+        ``xPermittedCrossDomainPolicies`` (str, default ``"none"``),
+        ``originAgentCluster`` (str, default ``"?1"``),
+        ``permissionsPolicy`` (str, empty by default — set to enable
+        feature-policy opt-outs). -#
+        configured: dict[str, str] = {}
         go! {
-            // Defaults.
+            // The heterogeneous options dict requires native assertions, but
+            // response mutation stays in typed Lam code below.
             csp := "default-src 'self'"
-            hstsMax := 15552000 // 180 days
+            hstsMax := 15552000
             hstsSub := true
+            values := map[string]*string{}
             xCTO := "nosniff"
             xFO := "DENY"
             ref := "no-referrer"
@@ -3437,87 +3575,66 @@ class Server {
             xpc := "none"
             oac := "?1"
             pp := ""
-
-            override := func(k string, dst *string) {
-                if v, ok := opts[k]; ok {
-                    if sv, sok := v.(string); sok {
-                        *dst = sv
-                    }
+            values["contentSecurityPolicy"] = &csp
+            values["xContentTypeOptions"] = &xCTO
+            values["xFrameOptions"] = &xFO
+            values["referrerPolicy"] = &ref
+            values["crossOriginOpenerPolicy"] = &coop
+            values["crossOriginResourcePolicy"] = &corp
+            values["xDnsPrefetchControl"] = &dnsP
+            values["xDownloadOptions"] = &dlo
+            values["xPermittedCrossDomainPolicies"] = &xpc
+            values["originAgentCluster"] = &oac
+            values["permissionsPolicy"] = &pp
+            for key, destination := range values {
+                if value, ok := opts[key].(string); ok {
+                    *destination = value
                 }
             }
-            override("contentSecurityPolicy", &csp)
-            override("xContentTypeOptions", &xCTO)
-            override("xFrameOptions", &xFO)
-            override("referrerPolicy", &ref)
-            override("crossOriginOpenerPolicy", &coop)
-            override("crossOriginResourcePolicy", &corp)
-            override("xDnsPrefetchControl", &dnsP)
-            override("xDownloadOptions", &dlo)
-            override("xPermittedCrossDomainPolicies", &xpc)
-            override("originAgentCluster", &oac)
-            override("permissionsPolicy", &pp)
-            if v, ok := opts["hstsMaxAge"]; ok {
-                if n, nok := v.(int); nok {
-                    hstsMax = n
-                }
-                if n, nok := v.(int64); nok {
-                    hstsMax = int(n)
-                }
+            if value, ok := opts["hstsMaxAge"].(int); ok {
+                hstsMax = value
             }
-            if v, ok := opts["hstsIncludeSubDomains"]; ok {
-                if b, bok := v.(bool); bok {
-                    hstsSub = b
-                }
+            if value, ok := opts["hstsIncludeSubDomains"].(bool); ok {
+                hstsSub = value
             }
-
-            s.OnResponseHooks = append(s.OnResponseHooks, func(req *Request, res *Response) {
-                if res.Headers == nil {
-                    res.Headers = map[string]string{}
+            configured["Content-Security-Policy"] = csp
+            if hstsMax > 0 {
+                hsts := fmt.Sprintf("max-age=%d", hstsMax)
+                if hstsSub {
+                    hsts += "; includeSubDomains"
                 }
-                set := func(name, value string) {
-                    if value == "" {
-                        return
-                    }
-                    // Don't stomp on headers the handler already set
-                    // — useful for routes that need a looser CSP.
-                    for k := range res.Headers {
-                        if strings.EqualFold(k, name) {
-                            return
-                        }
-                    }
-                    res.Headers[name] = value
-                }
-                set("Content-Security-Policy", csp)
-                if hstsMax > 0 {
-                    v := fmt.Sprintf("max-age=%d", hstsMax)
-                    if hstsSub {
-                        v += "; includeSubDomains"
-                    }
-                    set("Strict-Transport-Security", v)
-                }
-                set("X-Content-Type-Options", xCTO)
-                set("X-Frame-Options", xFO)
-                set("Referrer-Policy", ref)
-                set("Cross-Origin-Opener-Policy", coop)
-                set("Cross-Origin-Resource-Policy", corp)
-                set("X-DNS-Prefetch-Control", dnsP)
-                set("X-Download-Options", dlo)
-                set("X-Permitted-Cross-Domain-Policies", xpc)
-                set("Origin-Agent-Cluster", oac)
-                if pp != "" {
-                    set("Permissions-Policy", pp)
-                }
-            })
+                configured["Strict-Transport-Security"] = hsts
+            }
+            configured["X-Content-Type-Options"] = xCTO
+            configured["X-Frame-Options"] = xFO
+            configured["Referrer-Policy"] = ref
+            configured["Cross-Origin-Opener-Policy"] = coop
+            configured["Cross-Origin-Resource-Policy"] = corp
+            configured["X-DNS-Prefetch-Control"] = dnsP
+            configured["X-Download-Options"] = dlo
+            configured["X-Permitted-Cross-Domain-Policies"] = xpc
+            configured["Origin-Agent-Cluster"] = oac
+            configured["Permissions-Policy"] = pp
         }
+        securityHook: func(Request, Response) = lambda(req: Request, res: Response) -> None {
+            _ = req
+            for name in configured {
+                value: str = configured[name]
+                if value != "" and not res.hasHeader(name) {
+                    res.setHeader(name, value)
+                }
+            }
+        }
+        self.onResponse(securityHook)
     }
 
     func hasRoute(self, method: str, path: str) -> bool {
         #- ``true`` iff a route with the exact ``method`` +
         ``path`` pattern is currently registered. Useful in
         plugin setup to detect conflicts before piling on. The
-        path is matched * literally * (`` / users /: id`` won't match
-        `` / users / 42``) — use ``inject(...)`` for wildcard
-        checks. -  #
+        path is matched *literally* (``/users/:id`` won't match
+        ``/users/42``) — use ``inject(...)`` for wildcard
+        checks. -#
         go! {
             want := strings.ToUpper(method)
             for _, rr := range s.Routes {
@@ -3541,36 +3658,41 @@ class Server {
     }
 
     # ─── Runtime ───────────────────────────────────────────
-    func listen(self, port: int) {
-        #- Start the server on ``:port`` and block until ``close()``.
-        Fires ``onReady`` synchronously before bind, ``onListen``
-        after bind succeeds, and ``onClose`` during shutdown. -  #
+    func listen(self, port: int) -> Result[bool] {
+        #- Bind and serve until shutdown. Bind and unexpected serve failures
+        are returned as ``VultureListenError`` values. -#
         go! {
             srvLocal := s
             mux := http.NewServeMux()
             mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
                 lamServerHandle(srvLocal, w, r)
             })
-            // “onReady“ is the right place to acquire resources
-            // that must be live before any request lands.
             lamRunLifecycleHooks(s.OnReadyHooks, s)
             ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
             if err != nil {
-                panic("Server.listen: " + err.Error())
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "VultureListenError", err.Error(), nil,
+                ))
             }
             s.BoundAddr = ln.Addr().String()
             httpSrv := &http.Server{Handler: mux}
             s.RawSrv = httpSrv
-            // Surface the bound address to plugins (loggers, service
-            // registrars, …) before we start accepting traffic.
             lamRunLifecycleHooks(s.OnListenHooks, s)
-            httpSrv.Serve(ln)
+            serveErr := httpSrv.Serve(ln)
+            if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+                s.RawSrv = nil
+                s.BoundAddr = ""
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "VultureListenError", serveErr.Error(), nil,
+                ))
+            }
+            return LAMMERGEIER.Result.Ok(true)
         }
     }
 
-    func listenBackground(self, port: int) {
-        #- Same as ``listen`` but returns immediately; the server runs
-        in a goroutine. Useful for tests. -  #
+    func listenBackground(self, port: int) -> Result[bool] {
+        #- Bind synchronously, then serve in a goroutine. Startup failures are
+        returned before this method reports success. -#
         go! {
             srvLocal := s
             mux := http.NewServeMux()
@@ -3580,15 +3702,21 @@ class Server {
             lamRunLifecycleHooks(s.OnReadyHooks, s)
             ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
             if err != nil {
-                panic("Server.listenBackground: " + err.Error())
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "VultureListenError", err.Error(), nil,
+                ))
             }
             s.BoundAddr = ln.Addr().String()
             httpSrv := &http.Server{Handler: mux}
             s.RawSrv = httpSrv
             lamRunLifecycleHooks(s.OnListenHooks, s)
-            go func() { httpSrv.Serve(ln) }()
-            // Let the goroutine schedule before we return.
-            time.Sleep(20 * time.Millisecond)
+            go func() {
+                if serveErr := httpSrv.Serve(ln); serveErr != nil &&
+                    !errors.Is(serveErr, http.ErrServerClosed) && s.Debug {
+                    fmt.Fprintf(os.Stderr, "Vulture: background serve failure: %v\n", serveErr)
+                }
+            }()
+            return LAMMERGEIER.Result.Ok(true)
         }
     }
 
@@ -3596,7 +3724,7 @@ class Server {
         #- Shut the server down immediately, severing in-flight
         connections. Use ``shutdown(timeoutMs)`` for graceful
         drain. ``onClose`` hooks fire in reverse registration
-        order. -  #
+        order. -#
         go! {
             s.RawMu.(*sync.Mutex).Lock()
             defer s.RawMu.(*sync.Mutex).Unlock()
@@ -3612,10 +3740,10 @@ class Server {
 
     func shutdown(self, timeoutMs: int = 5000) {
         #- Graceful shutdown: stop accepting new connections and wait
-        up to ``timeoutMs`` for in - flight requests to finish. If the
-        timeout elapses, surviving connections are force - closed.
-        ``onClose`` hooks fire in reverse registration order * after *
-        the listener stops accepting new requests. -  #
+        up to ``timeoutMs`` for in-flight requests to finish. If the
+        timeout elapses, surviving connections are force-closed.
+        ``onClose`` hooks fire in reverse registration order *after*
+        the listener stops accepting new requests. -#
         go! {
             s.RawMu.(*sync.Mutex).Lock()
             defer s.RawMu.(*sync.Mutex).Unlock()
@@ -3636,9 +3764,9 @@ class Server {
         }
     }
 
-    func listenTLS(self, port: int, certFile: str, keyFile: str) {
-        #- Same as ``listen``, but serves HTTPS using the cert/key pair.
-        Blocks until ``close()`` / ``shutdown()``. -  #
+    func listenTLS(self, port: int, certFile: str, keyFile: str) -> Result[bool] {
+        #- TLS listener with synchronous certificate validation and explicit
+        bind/serve failures. TLS 1.2 remains the minimum version. -#
         go! {
             srvLocal := s
             mux := http.NewServeMux()
@@ -3646,23 +3774,42 @@ class Server {
                 lamServerHandle(srvLocal, w, r)
             })
             lamRunLifecycleHooks(s.OnReadyHooks, s)
+            certificate, certErr := tls.LoadX509KeyPair(certFile, keyFile)
+            if certErr != nil {
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "VultureTLSError", certErr.Error(), nil,
+                ))
+            }
             ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
             if err != nil {
-                panic("Server.listenTLS: " + err.Error())
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "VultureListenError", err.Error(), nil,
+                ))
             }
             s.BoundAddr = ln.Addr().String()
             httpSrv := &http.Server{
-                Handler:   mux,
-                TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+                Handler: mux,
+                TLSConfig: &tls.Config{
+                    MinVersion:   tls.VersionTLS12,
+                    Certificates: []tls.Certificate{certificate},
+                },
             }
             s.RawSrv = httpSrv
             lamRunLifecycleHooks(s.OnListenHooks, s)
-            httpSrv.ServeTLS(ln, certFile, keyFile)
+            serveErr := httpSrv.ServeTLS(ln, "", "")
+            if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+                s.RawSrv = nil
+                s.BoundAddr = ""
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "VultureTLSError", serveErr.Error(), nil,
+                ))
+            }
+            return LAMMERGEIER.Result.Ok(true)
         }
     }
 
-    func listenTLSBackground(self, port: int, certFile: str, keyFile: str) {
-        #- Non-blocking ``listenTLS``. Same caveats as ``listenBackground``. -#
+    func listenTLSBackground(self, port: int, certFile: str, keyFile: str) -> Result[bool] {
+        #- Validate and bind synchronously, then serve TLS in a goroutine. -#
         go! {
             srvLocal := s
             mux := http.NewServeMux()
@@ -3670,19 +3817,35 @@ class Server {
                 lamServerHandle(srvLocal, w, r)
             })
             lamRunLifecycleHooks(s.OnReadyHooks, s)
+            certificate, certErr := tls.LoadX509KeyPair(certFile, keyFile)
+            if certErr != nil {
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "VultureTLSError", certErr.Error(), nil,
+                ))
+            }
             ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
             if err != nil {
-                panic("Server.listenTLSBackground: " + err.Error())
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "VultureListenError", err.Error(), nil,
+                ))
             }
             s.BoundAddr = ln.Addr().String()
             httpSrv := &http.Server{
-                Handler:   mux,
-                TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+                Handler: mux,
+                TLSConfig: &tls.Config{
+                    MinVersion:   tls.VersionTLS12,
+                    Certificates: []tls.Certificate{certificate},
+                },
             }
             s.RawSrv = httpSrv
             lamRunLifecycleHooks(s.OnListenHooks, s)
-            go func() { httpSrv.ServeTLS(ln, certFile, keyFile) }()
-            time.Sleep(20 * time.Millisecond)
+            go func() {
+                if serveErr := httpSrv.ServeTLS(ln, "", ""); serveErr != nil &&
+                    !errors.Is(serveErr, http.ErrServerClosed) && s.Debug {
+                    fmt.Fprintf(os.Stderr, "Vulture: background TLS serve failure: %v\n", serveErr)
+                }
+            }()
+            return LAMMERGEIER.Result.Ok(true)
         }
     }
 
@@ -3693,16 +3856,15 @@ class Server {
 
     func openapi(self, info: any = None) -> str {
         #- Generate an OpenAPI 3.0 document covering every route
-        registered via ``routeOpts``(or any of the `` * Opts``
-        helpers). Routes registered via the bare verb shortcuts
+        registered with a typed ``RouteOptions`` overload. Routes registered via the bare verb shortcuts
         are still included but get empty schemas / descriptions.
-        Returns the document as JSON - serialised string. Pair with
+        Returns the document as a JSON-serialised string. Pair with
         ``server.get("/openapi.json", lambda req, res: res.json(srv.openapi()))``
         to expose it.
 
         ``info`` is an optional ``dict[str, any]`` honoured for
-        the ``info`` block(``title`` / ``version`` / ``description``).
-        Sensible defaults are used when omitted. -  #
+        the ``info`` block (``title``, ``version``, and ``description``).
+        Sensible defaults are used when omitted. -#
         go! {
             // ── info block ────────────────────────────────
             title := "Lammergeier API"
@@ -3897,13 +4059,11 @@ class Server {
     }
 
     func listRoutes(self) -> list[any] {
-        #- Return every registered route as ``[{"method": ..., "path": ...,
-        "summary": ..., "tags": ..., "meta": ...
-    }
-    , …]``. Routes
-    registered without `` * Opts`` get empty ``summary`` / ``tags``.
-    Useful for debug dashboards, route audits, OpenAPI generation,
-    or just printing on startup. -  #
+        #- Return every registered route as
+        ``[{"method": ..., "path": ..., "summary": ..., "tags": ...,
+        "meta": ...}, …]``. Routes registered without typed options get
+        empty ``summary`` and ``tags`` values. Useful for debug dashboards,
+        route audits, OpenAPI generation, or just printing on startup. -#
         go! {
             out := []interface{}{}
             for _, rr := range s.Routes {
@@ -3954,22 +4114,21 @@ class Server {
     }
 
     func printRoutes(self) -> str {
-    #- Return every registered route as a human-readable
-    string, one per line, sorted by path then method.
-    Meant for startup banners, CLI `` - - print - routes``
-    flags, and ad - hoc debugging. Fastify users will
-    recognise the ``METHOD / path < flags > `` shape.
+        #- Return every registered route as a human-readable string, one
+        per line, sorted by path then method. Meant for startup banners,
+        CLI ``--print-routes`` flags, and ad hoc debugging. Fastify users
+        will recognise the ``METHOD /path <flags>`` shape.
 
-    Each line looks like::
+        Each line looks like::
 
-    GET / hello summary = "Say hi" tags = [greeting]
-    POST / uploads[stream] bodyLimit = 10485760
-    PUT / items /: id[deprecated]
+        GET /hello summary="Say hi" tags=[greeting]
+        POST /uploads [stream] bodyLimit=10485760
+        PUT /items/:id [deprecated]
 
-    Flags(square - bracketed) appear only when the route has
-    them set: ``[deprecated]``, ``[hidden]``, ``[stream]``
-    (streamBody), ``[timeout = NNNms]``. The trailing
-    ``key = value`` pairs are omitted when empty / unset. -  #
+        Flags (square-bracketed) appear only when the route has them set:
+        ``[deprecated]``, ``[hidden]``, ``[stream]`` (``streamBody``), and
+        ``[timeout=NNNms]``. The trailing ``key=value`` pairs are omitted
+        when empty or unset. -#
         go! {
             type routeLine struct {
                 method, path, rest string
@@ -4054,17 +4213,14 @@ class Server {
         }
     }
 
-    func inject(self, method: str, path: str, body: str = "", headers: any = None) -> dict[str, any] {
-    #- In-process test harness, à la Fastify's ``server.inject()``:
-    run the full hook + route pipeline against a synthetic request
-    without binding a port. Returns a ``dict`` with keys
-    ``status``(int), ``body``(str), and ``headers``
-    (dict[str, str]).
+    func inject(self, method: str, path: str, body: str = "", headers: dict[str, str] = {}) -> InjectResponse {
+        #- In-process test harness, à la Fastify's ``server.inject()``:
+        run the full hook and route pipeline against a synthetic request
+        without binding a port. Returns a typed ``InjectResponse``.
 
-    Static - file mounts and SSE handlers are honoured
-    streaming
-    file responses fall back to in - memory bodies. WebSocket
-    upgrades are * not * simulated — call them over a real listener. -  #
+        Static-file mounts and SSE handlers are honoured; streaming file
+        responses fall back to in-memory bodies. WebSocket upgrades are
+        *not* simulated — call them over a real listener. -#
         go! {
             req := NewRequest()
             req.Method = strings.ToUpper(method)
@@ -4081,10 +4237,8 @@ class Server {
                 req.Path = path
             }
             req.Body = body
-            if hMap, ok := headers.(map[string]string); ok {
-                for k, v := range hMap {
-                    req.Headers[k] = v
-                }
+            for k, v := range headers {
+                req.Headers[k] = v
             }
             req.RemoteAddr = "inject"
 
@@ -4122,12 +4276,7 @@ class Server {
             for k, v := range res.Headers {
                 outHeaders[k] = v
             }
-            out := map[string]interface{}{
-                "status":  int(res.Status),
-                "body":    res.Body,
-                "headers": outHeaders,
-            }
-            return out
+            return NewInjectResponse(int(res.Status), res.Body, outHeaders)
         }
     }
 }
@@ -4447,7 +4596,7 @@ go! {
 
         // ── Route matching. Trie-backed for speed when populated
         //
-        //  (route()/routeOpts() index into it on registration).
+        //  (route() overloads index into it on registration).
         //  Falls back to a linear scan over ``srv.Routes`` so
         //  plugins that mutate ``srv.Routes`` directly (some
         //  pre-trie plugins do) still match.
@@ -4895,7 +5044,11 @@ go! {
 
         // Build the Lam Request from net/http.
         req := NewRequest()
-        req.Ctx = Context_fromNative(r.Context())
+        if contextResult := Context_fromNative(r.Context()); contextResult != nil {
+            if nativeContext, ok := contextResult.Value.(*Context); ok {
+                req.Ctx = nativeContext
+            }
+        }
         req.Method = r.Method
         req.Path = r.URL.Path
         req.RemoteAddr = r.RemoteAddr
@@ -5072,7 +5225,11 @@ go! {
                 ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeoutMs)*time.Millisecond)
                 defer cancel()
                 req.RawHttp = r.WithContext(ctx)
-                req.Ctx = Context_fromNative(ctx)
+                if contextResult := Context_fromNative(ctx); contextResult != nil {
+                    if nativeContext, ok := contextResult.Value.(*Context); ok {
+                        req.Ctx = nativeContext
+                    }
+                }
                 done := make(chan struct{})
                 go func() {
                     defer close(done)

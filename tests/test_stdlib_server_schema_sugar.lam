@@ -9,7 +9,7 @@
 # expect: openapi-xml=true
 # expect: invalid-schema-rejected=true
 
-from @lam/vulture import Request, Response, Server
+from @lam/vulture import InjectResponse, Request, Response, Server
 
 go! {
     import "strings"
@@ -29,37 +29,37 @@ func main() {
     yamlSchema: str = "type: object\nrequired: [name]\nproperties:\n  name:\n    type: string\n    minLength: 2\n"
     xsdSchema: str = "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><xs:element name=\"name\" type=\"xs:string\"/></xs:schema>"
 
-    server.post("/json", called, jsonSchema)
-    server.post("/none", called, None)
+    server.post("/json", called, jsonSchema, "json")
+    server.post("/none", called)
     server.post("/yaml", called, yamlSchema, "yaml")
     server.post("/xml", called, xsdSchema, "xml")
     invalidSchemaRejected: bool = false
     invalidSchemaText: str = "{not-" + "json}"
     try {
-        server.post("/invalid-schema", called, invalidSchemaText)
+        server.post("/invalid-schema", called, invalidSchemaText, "json")
     } catch err {
         invalidSchemaRejected = true
     }
 
-    jsonValid: dict[str, any] = server.inject("POST", "/json", '{"name":"Ada"}')
-    jsonInvalid: dict[str, any] = server.inject("POST", "/json", '{"name":"A"}')
-    noneSchema: dict[str, any] = server.inject("POST", "/none", "anything")
-    yamlValid: dict[str, any] = server.inject("POST", "/yaml", "name: Ada\n")
-    yamlInvalid: dict[str, any] = server.inject("POST", "/yaml", "name: A\n")
-    xmlValid: dict[str, any] = server.inject("POST", "/xml", "<name>Ada</name>")
-    xmlInvalid: dict[str, any] = server.inject("POST", "/xml", "<other>Ada</other>")
+    jsonValid: InjectResponse = server.inject("POST", "/json", '{"name":"Ada"}')
+    jsonInvalid: InjectResponse = server.inject("POST", "/json", '{"name":"A"}')
+    noneSchema: InjectResponse = server.inject("POST", "/none", "anything")
+    yamlValid: InjectResponse = server.inject("POST", "/yaml", "name: Ada\n")
+    yamlInvalid: InjectResponse = server.inject("POST", "/yaml", "name: A\n")
+    xmlValid: InjectResponse = server.inject("POST", "/xml", "<name>Ada</name>")
+    xmlInvalid: InjectResponse = server.inject("POST", "/xml", "<other>Ada</other>")
 
-    jsonValidStatus: any = jsonValid["status"]
-    jsonValidBody: any = jsonValid["body"]
-    jsonInvalidStatus: any = jsonInvalid["status"]
-    noneStatus: any = noneSchema["status"]
-    noneBody: any = noneSchema["body"]
-    yamlValidStatus: any = yamlValid["status"]
-    yamlValidBody: any = yamlValid["body"]
-    yamlInvalidStatus: any = yamlInvalid["status"]
-    xmlValidStatus: any = xmlValid["status"]
-    xmlValidBody: any = xmlValid["body"]
-    xmlInvalidStatus: any = xmlInvalid["status"]
+    jsonValidStatus: any = jsonValid.status
+    jsonValidBody: any = jsonValid.body
+    jsonInvalidStatus: any = jsonInvalid.status
+    noneStatus: any = noneSchema.status
+    noneBody: any = noneSchema.body
+    yamlValidStatus: any = yamlValid.status
+    yamlValidBody: any = yamlValid.body
+    yamlInvalidStatus: any = yamlInvalid.status
+    xmlValidStatus: any = xmlValid.status
+    xmlValidBody: any = xmlValid.body
+    xmlInvalidStatus: any = xmlInvalid.status
     print(f"json-valid={jsonValidStatus}:{jsonValidBody}")
     print(f"json-invalid={jsonInvalidStatus}")
     print(f"none-schema={noneStatus}:{noneBody}")

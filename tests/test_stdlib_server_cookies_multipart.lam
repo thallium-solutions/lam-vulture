@@ -13,7 +13,7 @@
 # expect: cookie-set-has-max-age: true
 # expect: cookie-cleared-has-expires: true
 # expect: signed-roundtrip: tamper-evident
-# expect: signed-tampered:
+# expect: signed-tampered:invalid
 # expect: upload-field-name: alice
 # expect: upload-file-filename: hello.txt
 # expect: upload-file-contenttype: application/octet-stream
@@ -22,6 +22,7 @@
 # expect: upload-multifile-count: 2
 
 from @lam/vulture import Server, Request, Response
+from lamerrors import Result
 from lamjson import Json
 
 go! {
@@ -35,8 +36,14 @@ go! {
     )
 }
 
+func resultJson(result: Result[json]) -> json {
+    go! {
+        return result.Value.(LamJSON)
+    }
+}
+
 func echoCookie(req: Request, res: Response) {
-    v: str = req.cookie("lam")
+    v: str = str(req.cookie("lam").value)
     res.text("lam=" + v)
 }
 
@@ -56,7 +63,12 @@ func setSigned(req: Request, res: Response) {
 }
 
 func readSigned(req: Request, res: Response) {
-    res.text(req.signedCookie("auth", "topsecret"))
+    result: Result[str] = req.signedCookie("auth", "topsecret")
+    if not result.ok() {
+        res.text("invalid")
+        return
+    }
+    res.text(str(result.value))
 }
 
 func upload(req: Request, res: Response) {
@@ -73,7 +85,7 @@ func upload(req: Request, res: Response) {
             }
         }
     }
-    res.json(Json.fromDict(out))
+    res.json(resultJson(Json.fromDict(out)))
 }
 
 func uploadMany(req: Request, res: Response) {
@@ -92,11 +104,11 @@ func main() {
     s.post("/upload", upload)
     s.post("/upload-many", uploadMany)
 
-    s.listenBackground(0)
+    _ = s.listenBackground(0).unwrap()
     go! {
         // Wait briefly for the listener to bind. listenBackground
-        // populates BoundAddr from inside the server goroutine; we
-        // spin until it's published.
+        // binds before returning success, so BoundAddr is already
+        // published here.
         for i := 0; i < 50 && s.BoundAddr == ""; i++ {
             time.Sleep(10 * time.Millisecond)
         }

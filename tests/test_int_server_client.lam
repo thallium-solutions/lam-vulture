@@ -18,7 +18,8 @@
 # expect: server_client_ok
 
 from @lam/vulture import Server, Request, Response
-from lamhttp import Http
+from lamerrors import Result
+from lamhttp import Http, HttpResponse
 
 func echoHandler(req: Request, res: Response) {
     # Read the raw request body and ship it back. Used to confirm
@@ -55,6 +56,12 @@ go! {
     import "strconv"
 }
 
+func responseBody(result: Result[HttpResponse]) -> str {
+    go! {
+        return result.Value.(*HttpResponse).Body
+    }
+}
+
 func int_(s: str) -> int {
     go! {
         n, _ := strconv.Atoi(s)
@@ -70,31 +77,31 @@ func main() {
     srv.get("/add", addHandler)
     srv.get("/protected", protectedHandler)
 
-    srv.listenBackground(18282)
+    _ = srv.listenBackground(18282).unwrap()
 
     # POST with a body — server should echo it back verbatim.
-    echoed: str = Http.post("http://127.0.0.1:18282/echo",
-    "text/plain", "hello-world")
+    echoed: str = responseBody(Http.post("http://127.0.0.1:18282/echo",
+    "text/plain", "hello-world"))
     print(f"echo_payload={echoed}")
 
     # GET with query string.
-    sum: str = Http.get("http://127.0.0.1:18282/add?a=29&b=13")
+    sum: str = responseBody(Http.get("http://127.0.0.1:18282/add?a=29&b=13"))
     print(f"add_result={sum}")
 
     # /protected without the X-Auth header → 401 short-circuit.
-    noAuth: str = Http.get("http://127.0.0.1:18282/protected")
+    noAuth: str = responseBody(Http.get("http://127.0.0.1:18282/protected"))
     print(f"missing_no_auth={noAuth}")
 
     # /protected with the right header → handler runs.
     headers: dict[str, str] = {}
     headers["X-Auth"] = "letmein"
-    okBody: str = Http.getWithHeaders("http://127.0.0.1:18282/protected",
-    headers)
+    okBody: str = responseBody(Http.getWithHeaders("http://127.0.0.1:18282/protected",
+    headers))
     print(f"missing_with_auth={okBody}")
 
     # onResponse hook: X-Frame header should be set on every reply.
-    frame: str = Http.getHeader("http://127.0.0.1:18282/add?a=1&b=2",
-    "X-Frame")
+    frame: str = str(Http.getHeader("http://127.0.0.1:18282/add?a=1&b=2",
+    "X-Frame").value)
     headerOk: bool = frame == "lamserver"
     print(f"header_present={headerOk}")
 

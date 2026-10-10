@@ -15,7 +15,7 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 TEST_ROOT = Path(__file__).resolve().parent
 COMPILER = "lamc"
-MIN_COMPILER_VERSION = (1, 17, 0)
+MIN_COMPILER_VERSION = (1, 18, 0)
 PACKAGE_PATH = Path("@lam") / "vulture"
 VERSION_PATTERN = re.compile(r"(?:lamc\s+)?v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?")
 

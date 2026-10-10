@@ -54,7 +54,7 @@ func main() {
     srv.onRequestAbort(recordAbort)
     srv.get("/slow", slowHandler)
 
-    srv.listenBackground(0)
+    _ = srv.listenBackground(0).unwrap()
     addr: str = srv.boundAddr
     url: str = "http://" + addr + "/slow"
 

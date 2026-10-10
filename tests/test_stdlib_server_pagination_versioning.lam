@@ -16,7 +16,7 @@
 # expect: v-explicit-v1: v1:list
 # expect: v-unknown-status: 406
 
-from @lam/vulture import Server, Request, Response
+from @lam/vulture import InjectResponse, Server, Request, Response
 
 go! {
     import (
@@ -55,8 +55,8 @@ func main() {
     srv.get("/items/first", pageFirstHandler)
 
     # ── pagination
-    o: dict[str, any] = srv.inject("GET", "/items")
-    h: any = o["headers"]
+    o: InjectResponse = srv.inject("GET", "/items")
+    h: any = o.headers
     total: str = ""
     page: str = ""
     perPage: str = ""
@@ -91,8 +91,8 @@ func main() {
     print(f"p1-link-has-last: {hasLast}")
 
     # Last page shouldn't have a `next` link.
-    oLast: dict[str, any] = srv.inject("GET", "/items/last")
-    hLast: any = oLast["headers"]
+    oLast: InjectResponse = srv.inject("GET", "/items/last")
+    hLast: any = oLast.headers
     linkLast: str = ""
     go! {
         if hh, ok := hLast.(map[string]string); ok {
@@ -106,8 +106,8 @@ func main() {
     print(f"p-last-no-next: {noNext}")
 
     # First page shouldn't have a `prev` link.
-    oFirst: dict[str, any] = srv.inject("GET", "/items/first")
-    hFirst: any = oFirst["headers"]
+    oFirst: InjectResponse = srv.inject("GET", "/items/first")
+    hFirst: any = oFirst.headers
     linkFirst: str = ""
     go! {
         if hh, ok := hFirst.(map[string]string); ok {
@@ -122,28 +122,28 @@ func main() {
 
     # ── versionedRoute
     srv2: Server = Server()
-    handlers: dict[str, any] = {}
+    handlers: dict[str, func(Request, Response)] = {}
     handlers["v1"] = v1Handler
     handlers["v2"] = v2Handler
     srv2.versionedRoute("GET", "/list", handlers, "v1", "Accept-Version")
 
     # No header → fallback to v1.
-    r0: dict[str, any] = srv2.inject("GET", "/list")
-    b0: any = r0["body"]
+    r0: InjectResponse = srv2.inject("GET", "/list")
+    b0: any = r0.body
     print(f"v-default: {b0}")
 
     # Explicit v2.
     headers2: dict[str, str] = {}
     headers2["Accept-Version"] = "v2"
-    r2: dict[str, any] = srv2.inject("GET", "/list", "", headers2)
-    b2: any = r2["body"]
+    r2: InjectResponse = srv2.inject("GET", "/list", "", headers2)
+    b2: any = r2.body
     print(f"v-v2: {b2}")
 
     # Explicit v1.
     headers1: dict[str, str] = {}
     headers1["Accept-Version"] = "v1"
-    r1: dict[str, any] = srv2.inject("GET", "/list", "", headers1)
-    b1: any = r1["body"]
+    r1: InjectResponse = srv2.inject("GET", "/list", "", headers1)
+    b1: any = r1.body
     print(f"v-explicit-v1: {b1}")
 
     # Unknown version + no fallback → 406. We rebuild a fresh server
@@ -152,7 +152,7 @@ func main() {
     srv3.versionedRoute("GET", "/list", handlers, "", "Accept-Version")
     headersBad: dict[str, str] = {}
     headersBad["Accept-Version"] = "v9"
-    rBad: dict[str, any] = srv3.inject("GET", "/list", "", headersBad)
-    badStatus: any = rBad["status"]
+    rBad: InjectResponse = srv3.inject("GET", "/list", "", headersBad)
+    badStatus: any = rBad.status
     print(f"v-unknown-status: {badStatus}")
 }

@@ -100,10 +100,10 @@ func sseHandler(req: Request, res: Response) {
 func main() {
     srv: Server = Server()
     srv.get("/events", sseHandler)
-    srv.listenBackground(18787)
+    _ = srv.listenBackground(18787).unwrap()
 
-    ct: str = Http.getHeader("http://127.0.0.1:18787/events", "Content-Type")
-    cache: str = Http.getHeader("http://127.0.0.1:18787/events", "Cache-Control")
+    ct: str = str(Http.getHeader("http://127.0.0.1:18787/events", "Content-Type").value)
+    cache: str = str(Http.getHeader("http://127.0.0.1:18787/events", "Cache-Control").value)
     print(f"ct: {ct}")
     print(f"cache: {cache}")
 
