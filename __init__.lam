@@ -3501,9 +3501,9 @@ class Server {
 
     func _applyCorsHeaders(self, req: Request, res: Response, origin: str, methods: str, headers: str) {
         _ = req
-        res.setHeader("Access-Control-Allow-Origin", origin)
-        res.setHeader("Access-Control-Allow-Methods", methods)
-        res.setHeader("Access-Control-Allow-Headers", headers)
+        _ = res.setHeader("Access-Control-Allow-Origin", origin)
+        _ = res.setHeader("Access-Control-Allow-Methods", methods)
+        _ = res.setHeader("Access-Control-Allow-Headers", headers)
     }
 
     func _applyCorsPreflight(self, req: Request, res: Response) {

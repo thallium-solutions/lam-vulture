@@ -2,6 +2,14 @@
 
 All notable changes to `@lam/vulture` are documented here.
 
+## 2.0.1 - 2026-10-15
+
+### Changed
+
+- Discard ignored response-builder results explicitly (`_ = res.setHeader(...)`) in
+  the CORS helper so the package passes `lamc` 1.19's semantic check without
+  warnings. No API change.
+
 ## 2.0.0 - 2026-09-30
 
 ### Added
