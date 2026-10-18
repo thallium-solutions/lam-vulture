@@ -12,7 +12,7 @@ formerly supplied by Lammergeier's `lamserver` standard-library module.
 
 ## Requirements
 
-- `lamc` 1.18.0 or newer (`^1.18` compatibility).
+- `lamc` 1.18.0 or newer (`>=1.18, <3` compatibility, including 2.x).
 - A Go toolchain available to `lamc`.
 
 ## Installation
