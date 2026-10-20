@@ -2,6 +2,13 @@
 
 All notable changes to `@lam/vulture` are documented here.
 
+## [2.0.3] - 2026-10-20
+
+### Changed
+
+- Compatible with `lamc` 3.x: `compatibility.lamc = ">=1.18, <4"` (test runner too).
+- Integer divisions use `//` (lamc 3.0 makes `/` a float division).
+
 ## [2.0.2] - 2026-10-18
 
 ### Changed

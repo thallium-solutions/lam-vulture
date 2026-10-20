@@ -2002,7 +2002,7 @@ class Response {
         self.headers["X-Total-Count"] = str(total)
         self.headers["X-Pagination-Page"] = str(page)
         self.headers["X-Pagination-Per-Page"] = str(perPage)
-        totalPages: int = (total + perPage - 1) / perPage
+        totalPages: int = (total + perPage - 1) // perPage
         if totalPages < 1 {
             totalPages = 1
         }
