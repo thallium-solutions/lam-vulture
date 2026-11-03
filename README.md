@@ -12,7 +12,7 @@ formerly supplied by Lammergeier's `lamserver` standard-library module.
 
 ## Requirements
 
-- `lamc` 1.18.0 or newer (`>=1.18, <4` compatibility, including 2.x).
+- `lamc` 4.0 or newer (`>=4.0, <5`): handlers use the native `html` / `xml` types.
 - A Go toolchain available to `lamc`.
 
 ## Installation
@@ -26,7 +26,7 @@ lamc install https://github.com/thallium-solutions/lam-vulture.git
 Install the registry release:
 
 ```bash
-lamc install @lam/vulture@2.0.0
+lamc install @lam/vulture@3.0.0
 ```
 
 Install a local checkout during development:
@@ -63,9 +63,55 @@ func main() {
 ```
 
 Handlers receive a `Request` and `Response`. A response helper such as
-`text`, `json`, `send`, `html`, `redirect`, `streamFile`, or `sse` completes the
-response. Hooks can use the same helpers to short-circuit the remaining request
-pipeline.
+`text`, `json`, `send`, `html`, `xml`, `redirect`, `streamFile`, or `sse`
+completes the response. Hooks can use the same helpers to short-circuit the
+remaining request pipeline.
+
+### Returning the body
+
+A handler may also return its body as a native value; it is sent with the
+type's default Content-Type:
+
+| Handler returns | Content-Type |
+| --- | --- |
+| `html` | `text/html; charset=utf-8` |
+| `xml` | `application/xml; charset=utf-8` |
+| `json` | `application/json` |
+| `str` | `text/plain; charset=utf-8` |
+
+A Content-Type set by the handler (`res.type_("application/rss+xml")`) wins,
+`res.code(...)`, headers and cookies apply as usual, and a handler that sends
+a response itself (`res.redirect(...)`, `res.json(...)`) keeps it: the
+returned value is then ignored. Handlers without a result work as before.
+
+```lammergeier
+from @lam/vulture import Server, Request, Response
+
+func productRows(req: Request, res: Response) -> html {
+    names: list[str] = ["Bag", "Shoes & socks"]
+    return <>${[<><tr><td>${name}</td></tr></> for name in names]}</>
+}
+
+func sitemap(req: Request, res: Response) -> xml {
+    return <><?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"/></>
+}
+
+func status(req: Request, res: Response) -> json {
+    return {"ok": true}
+}
+
+func main() {
+    app: Server = Server()
+    app.get("/products/rows", productRows)   # an htmx fragment
+    app.get("/sitemap.xml", sitemap)
+    app.get("/status", status)
+    _ = app.listen(8080).unwrap()
+}
+```
+
+`res.send(value)` takes `str` (Content-Type as already set, else
+`application/octet-stream`), `html` or `xml` (their default unless one is
+set); `res.html(...)` and `res.xml(...)` take the native value or a `str`.
 
 ## Hooks and plugins
 
@@ -190,7 +236,7 @@ The complete public implementation is exported from `__init__.lam`.
   `ctx`, Result-based JSON/form parsing and cookie verification, multipart
   bodies, streaming body readers, proxy-aware IP/scheme helpers, decorators,
   request IDs, route metadata, timing, and URL helpers.
-- `Response` — status/header/body builders, JSON/text/HTML/redirect/error
+- `Response` — status/header/body builders, JSON/text/HTML/XML/redirect/error
   responses, pagination, cookies and signed cookies, file streaming, SSE,
   HTTP/2 push, decorators, serialization, response timing, not-found handoff,
   and connection hijacking.

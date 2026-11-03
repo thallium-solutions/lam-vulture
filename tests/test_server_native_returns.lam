@@ -1,0 +1,130 @@
+# Test: handlers return their body as a native value — html, xml, json or
+# str — and get the matching default Content-Type; a Content-Type the
+# handler set wins; a handler that sends its own response keeps it;
+# res.send / res.html / res.xml take the native types; void handlers and
+# string bodies keep working.
+#
+# expect: html: 200 text/html; charset=utf-8 <h1>Hi &lt;you&gt;</h1>
+# expect: xml: 200 application/xml; charset=utf-8 <feed><entry id="1"/></feed>
+# expect: json: 201 application/json {"ok":true,"path":"/api"}
+# expect: str: 200 text/plain; charset=utf-8 pong
+# expect: override: 200 application/rss+xml <rss/>
+# expect: sent-wins: 302 /login
+# expect: void: 200 text/plain; charset=utf-8 classic
+# expect: send-html: 200 text/html; charset=utf-8 <p>sent</p>
+# expect: send-xml: 200 application/atom+xml <feed/>
+# expect: send-str: 200 text/csv a,b
+# expect: res-html: 200 text/html; charset=utf-8 <b>x</b>
+# expect: res-html-str: 200 text/html; charset=utf-8 <i>raw</i>
+# expect: res-xml: 200 application/xml; charset=utf-8 <a/>
+# expect: not-found: 404 text/html; charset=utf-8 <h1>Not found: /nope</h1>
+# expect: htmx-fragment: <tr><td>1</td></tr><tr><td>2</td></tr>
+
+from @lam/vulture import InjectResponse, Server, Request, Response
+
+func page(req: Request, res: Response) -> html {
+    who: str = req.query["who"] if "who" in req.query else "<you>"
+    return <><h1>Hi ${who}</h1></>
+}
+
+func feed(req: Request, res: Response) -> xml {
+    return <><feed><entry id="1"/></feed></>
+}
+
+func api(req: Request, res: Response) -> json {
+    res.code(201)
+    return {"ok": true, "path": req.path}
+}
+
+func ping(req: Request, res: Response) -> str {
+    return "pong"
+}
+
+func rss(req: Request, res: Response) -> xml {
+    res.type_("application/rss+xml")
+    return <><rss/></>
+}
+
+func guarded(req: Request, res: Response) -> html {
+    res.redirect("/login")
+    return <><p>never sent</p></>
+}
+
+func classic(req: Request, res: Response) {
+    res.text("classic")
+}
+
+func sendHtml(req: Request, res: Response) {
+    res.send(<><p>sent</p></>)
+}
+
+func sendXml(req: Request, res: Response) {
+    res.type_("application/atom+xml")
+    doc: xml = <><feed/></>
+    res.send(doc)
+}
+
+func sendStr(req: Request, res: Response) {
+    res.type_("text/csv")
+    res.send("a,b")
+}
+
+func resHtml(req: Request, res: Response) {
+    res.html(<><b>x</b></>)
+}
+
+func resHtmlStr(req: Request, res: Response) {
+    res.html("<i>raw</i>")
+}
+
+func resXml(req: Request, res: Response) {
+    res.xml(<><a/></>)
+}
+
+func missing(req: Request, res: Response) -> html {
+    res.code(404)
+    return <><h1>Not found: ${req.path}</h1></>
+}
+
+func rows(req: Request, res: Response) -> html {
+    return <>${[<><tr><td>${n}</td></tr></> for n in [1, 2]]}</>
+}
+
+func show(label: str, r: InjectResponse) {
+    print(f"{label}: {r.status} {r.header('Content-Type')} {r.body}")
+}
+
+func main() {
+    srv: Server = Server()
+    srv.get("/page", page)
+    srv.get("/feed", feed)
+    srv.post("/api", api)
+    srv.get("/ping", ping)
+    srv.get("/rss", rss)
+    srv.get("/guarded", guarded)
+    srv.get("/classic", classic)
+    srv.get("/send-html", sendHtml)
+    srv.get("/send-xml", sendXml)
+    srv.get("/send-str", sendStr)
+    srv.get("/res-html", resHtml)
+    srv.get("/res-html-str", resHtmlStr)
+    srv.get("/res-xml", resXml)
+    srv.get("/rows", rows)
+    srv.notFound(missing)
+    show("html", srv.inject("GET", "/page"))
+    show("xml", srv.inject("GET", "/feed"))
+    show("json", srv.inject("POST", "/api"))
+    show("str", srv.inject("GET", "/ping"))
+    show("override", srv.inject("GET", "/rss"))
+    redirected: InjectResponse = srv.inject("GET", "/guarded")
+    print(f"sent-wins: {redirected.status} {redirected.header('Location')}")
+    show("void", srv.inject("GET", "/classic"))
+    show("send-html", srv.inject("GET", "/send-html"))
+    show("send-xml", srv.inject("GET", "/send-xml"))
+    show("send-str", srv.inject("GET", "/send-str"))
+    show("res-html", srv.inject("GET", "/res-html"))
+    show("res-html-str", srv.inject("GET", "/res-html-str"))
+    show("res-xml", srv.inject("GET", "/res-xml"))
+    show("not-found", srv.inject("GET", "/nope"))
+    print(f"htmx-fragment: {srv.inject('GET', '/rows').body}")
+}

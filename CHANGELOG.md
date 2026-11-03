@@ -2,6 +2,25 @@
 
 All notable changes to `@lam/vulture` are documented here.
 
+## [3.0.0] - 2026-11-03
+
+### Added
+
+- Handlers may return their body: `func h(req: Request, res: Response) -> html`
+  (also `xml`, `json`, `str`). The value is sent with its default
+  Content-Type (`text/html; charset=utf-8`, `application/xml; charset=utf-8`,
+  `application/json`, `text/plain; charset=utf-8`) unless the handler set
+  one; a handler that already sent a response keeps it. Route registration,
+  `notFound` and `setNotFoundHandler` accept every handler shape (checked by
+  the compiler).
+- `res.send(html)`, `res.send(xml)`, `res.html(html)`, `res.xml(xml)` and
+  `res.xml(str)`.
+
+### Changed
+
+- Requires `lamc` 4.0 (native `html` / `xml` types): `compatibility.lamc =
+  ">=4.0, <5"`.
+
 ## [2.0.3] - 2026-10-20
 
 ### Changed
