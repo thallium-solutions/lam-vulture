@@ -1,0 +1,42 @@
+# Test: HEAD is answered by the GET route without a body (it was a 405), and
+# req.queryAll returns every value of a repeated query parameter.
+#
+# expect: head: 200 text/html; charset=utf-8 body=0
+# expect: get: 200 <p>page</p>
+# expect: head-post-only: 405
+# expect: query-all: a|b|c first=a missing=0
+# expect: explicit-head: 204
+
+from @lam/vulture import InjectResponse, Server, Request, Response
+
+func page(req: Request, res: Response) -> html {
+    return <><p>page</p></>
+}
+
+func brands(req: Request, res: Response) -> str {
+    return f"{'|'.join(req.queryAll('brand'))} first={req.query['brand']} missing={len(req.queryAll('nope'))}"
+}
+
+func submit(req: Request, res: Response) -> str {
+    return "posted"
+}
+
+func ownHead(req: Request, res: Response) {
+    _ = res.code(204).send("")
+}
+
+func main() {
+    srv: Server = Server()
+    srv.get("/page", page)
+    srv.get("/brands", brands)
+    srv.post("/submit", submit)
+    srv.get("/both", page)
+    srv.head("/both", ownHead)
+    head: InjectResponse = srv.inject("HEAD", "/page")
+    print(f"head: {head.status} {head.header('Content-Type')} body={len(head.body)}")
+    get: InjectResponse = srv.inject("GET", "/page")
+    print(f"get: {get.status} {get.body}")
+    print(f"head-post-only: {srv.inject('HEAD', '/submit').status}")
+    print(f"query-all: {srv.inject('GET', '/brands?brand=a&brand=b&brand=c').body}")
+    print(f"explicit-head: {srv.inject('HEAD', '/both').status}")
+}

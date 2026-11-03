@@ -2,6 +2,18 @@
 
 All notable changes to `@lam/vulture` are documented here.
 
+## [3.1.0] - 2026-11-03
+
+### Added
+
+- `req.queryAll(name)`: every value of a repeated query parameter
+  (`?brand=a&brand=b`); `req.query` still holds the first one.
+
+### Fixed
+
+- `HEAD` requests got 405 on routes registered with `get`: a GET route now
+  answers them without a body (an explicit `head` route still wins).
+
 ## [3.0.0] - 2026-11-03
 
 ### Added

@@ -585,6 +585,16 @@ go! {
                 return &rcopy, params, nil
             }
         }
+        // HEAD is GET without a body (RFC 9110): a GET route answers it.
+        if method == "HEAD" {
+            if root, ok := t.roots["GET"]; ok {
+                params := map[string]string{}
+                if r, found := lamTrieWalk(root, segs, 0, params, "GET"); found {
+                    rcopy := r
+                    return &rcopy, params, nil
+                }
+            }
+        }
         // Method not found at this exact path → look across all
         // methods to surface a 405 with a useful Allow header.
         var allow []string
@@ -1302,6 +1312,9 @@ class Request {
         self.body: str = ""
         self.headers: dict[str, str] = {}
         self.query: dict[str, str] = {}
+        #- Every value of each query parameter (``?brand=a&brand=b``);
+           ``query`` holds the first one. -#
+        self.queryMulti: dict[str, list[str]] = {}
         self.params: dict[str, str] = {}
         self.remoteAddr: str = ""
         self.ctx: Context = Context.simple()
@@ -1328,6 +1341,15 @@ class Request {
             }
         }
         return ""
+    }
+
+    func queryAll(self, name: str) -> list[str] {
+        #- Every value of the query parameter ``name`` in order (empty when absent). -#
+        if name in self.queryMulti {
+            return self.queryMulti[name]
+        }
+        out: list[str] = []
+        return out
     }
 
     func queryGet(self, name: str, fallback: str = "") -> str {
@@ -4328,6 +4350,7 @@ class Server {
                 for k, vs := range u.Query() {
                     if len(vs) > 0 {
                         req.Query[k] = vs[0]
+                        req.QueryMulti[k] = vs
                     }
                 }
             } else {
@@ -4373,7 +4396,11 @@ class Server {
             for k, v := range res.Headers {
                 outHeaders[k] = v
             }
-            return NewInjectResponse(int(res.Status), res.Body, outHeaders)
+            injectBody := res.Body
+            if req.Method == "HEAD" {
+                injectBody = ""
+            }
+            return NewInjectResponse(int(res.Status), injectBody, outHeaders)
         }
     }
 }
@@ -5161,6 +5188,7 @@ go! {
         for k, vs := range r.URL.Query() {
             if len(vs) > 0 {
                 req.Query[k] = vs[0]
+                req.QueryMulti[k] = vs
             }
         }
         // Surface the connection's actual scheme so realScheme()

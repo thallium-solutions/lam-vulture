@@ -26,7 +26,7 @@ lamc install https://github.com/thallium-solutions/lam-vulture.git
 Install the registry release:
 
 ```bash
-lamc install @lam/vulture@3.0.0
+lamc install @lam/vulture@3.1.0
 ```
 
 Install a local checkout during development:
@@ -232,7 +232,7 @@ The complete public implementation is exported from `__init__.lam`.
   request limits and timeouts, CORS/security headers, static mounts, versioned
   routes, Result-based listeners/TLS, shutdown, typed `inject`, `listRoutes`,
   `printRoutes`, and `openapi`.
-- `Request` — method/path/body/header/query/parameter data, cancellation-aware
+- `Request` — method/path/body/header/query (`queryAll` for repeated parameters)/parameter data, cancellation-aware
   `ctx`, Result-based JSON/form parsing and cookie verification, multipart
   bodies, streaming body readers, proxy-aware IP/scheme helpers, decorators,
   request IDs, route metadata, timing, and URL helpers.
