@@ -1,0 +1,219 @@
+# Test: srv.setPayloadTooLargeHandler and RouteOptions.onPayloadTooLarge.
+#
+# A body above the effective limit (route bodyLimit, else server
+# bodyLimit) is refused before any hook runs, over real HTTP (the
+# transport's MaxBytesReader) and through inject alike; the handler shapes
+# the 413 with req.method / path / headers / params / routeOptions
+# available. Streamed routes call it when the body-limit error escapes the
+# handler. The default response is unchanged.
+#
+# expect: inject-default: 413 text/plain; charset=utf-8 413 payload too large hooks=0
+# expect: inject-server-handler: 413 application/problem+json server POST /small hooks=0
+# expect: inject-route-handler: 413 application/problem+json route POST /orders/7 id=7 op=createOrder trace=t-1
+# expect: inject-route-limit-beats-server: 200
+# expect: inject-within-limit: 200 small
+# expect: inject-unmatched-path: 413 application/problem+json server POST /nowhere
+# expect: inject-not-sent: 413 text/plain; charset=utf-8 413 payload too large retry=60
+# expect: inject-panicking: 413 text/plain; charset=utf-8 413 payload too large
+# expect: inject-streamed: 413 application/problem+json route POST /stream
+# expect: inject-streamed-httperror: 413 application/problem+json server POST /stream-raise
+# expect: inject-streamed-default: 413 application/json; charset=utf-8
+# expect: inject-streamed-small: 200 5
+# expect: http-default: 413 text/plain; charset=utf-8 413 payload too large hooks=0
+# expect: http-server-handler: 413 application/problem+json server POST /small hooks=0
+# expect: http-route-handler: 413 application/problem+json route POST /orders/7 id=7 op=createOrder trace=t-1
+# expect: http-route-limit-beats-server: 200
+# expect: http-within-limit: 200 text/plain; charset=utf-8 small
+# expect: http-streamed: 413 application/problem+json route POST /stream
+# expect: http-streamed-httperror: 413 application/problem+json server POST /stream-raise
+# expect: http-streamed-default: 413
+# expect: http-streamed-small: 200 text/plain; charset=utf-8 5
+
+from lamjson import Json
+from lamerrors import Result
+from @lam/vulture import InjectResponse, Request, Response, RouteOptions, Server
+
+func small(_req: Request, _res: Response) -> str {
+    return "small"
+}
+
+func counted(_req: Request, _res: Response) {
+    go! {
+        lamTestHookCount.Add(1)
+    }
+}
+
+func streamed(req: Request, _res: Response) -> str {
+    body: str = req.bodyReader().readAll().unwrap()
+    return str(len(body))
+}
+
+func streamedRaise(req: Request, _res: Response) -> str {
+    drained: Result[str] = req.bodyReader().readAll()
+    if not drained.ok() {
+        go! {
+            panic(drained.Error)
+        }
+    }
+    return "unreachable"
+}
+
+func problem(source: str, req: Request, res: Response) {
+    options: dict[str, any] = req.routeOptions()
+    op: str = ""
+    if "operationId" in options {
+        op = str(options["operationId"])
+    }
+    params: str = ""
+    if ":id" in req.params {
+        params = f" id={req.params[':id']}"
+    }
+    if op != "" {
+        params = params + f" op={op}"
+    }
+    trace: str = req.header("X-Trace")
+    if trace != "" {
+        params = params + f" trace={trace}"
+    }
+    doc: json = {"title": "Payload Too Large", "detail": f"{source} {req.method} {req.path}{params}"}
+    _ = res.code(413).type_("application/problem+json").send(Json.encode(doc).unwrap())
+}
+
+func serverHandler(req: Request, res: Response) {
+    problem("server", req, res)
+}
+
+func routeHandler(req: Request, res: Response) {
+    problem("route", req, res)
+}
+
+func notSending(_req: Request, res: Response) {
+    _ = res.header("Retry-After", "60")
+}
+
+func panicking(_req: Request, _res: Response) {
+    throw "boom"
+}
+
+func detail(status: int, contentType: str, body: str) -> str {
+    if contentType == "application/problem+json" {
+        parsed: json = Json.decode(body).unwrap()
+        text: str = parsed["detail"]
+        return f"{status} {contentType} {text}"
+    }
+    return f"{status} {contentType} {body}"
+}
+
+func hooks() -> int {
+    n: int = 0
+    go! {
+        n = int(lamTestHookCount.Swap(0))
+    }
+    return n
+}
+
+func build(withServerHandler: bool) -> Server {
+    srv: Server = Server()
+    srv.bodyLimit = 16
+    srv.onRequest(counted)
+    srv.preParsing(counted)
+    if withServerHandler {
+        srv.setPayloadTooLargeHandler(serverHandler)
+    }
+    srv.post("/small", small)
+    orderOptions: RouteOptions = RouteOptions(8).onPayloadTooLarge(routeHandler)
+    orderOptions.operationId = "createOrder"
+    srv.post("/orders/:id", small, orderOptions)
+    srv.post("/big", small, RouteOptions(1024))
+    srv.post("/stream", streamed, RouteOptions(8, 0, true).onPayloadTooLarge(routeHandler))
+    srv.post("/stream-raise", streamedRaise, RouteOptions(8, 0, true))
+    return srv
+}
+
+func main() {
+    big: str = "x".repeat(40)
+    plain: Server = build(false)
+    r: InjectResponse = plain.inject("POST", "/small", big)
+    print(f"inject-default: {detail(r.status, r.header('Content-Type'), r.body)} hooks={hooks()}")
+
+    srv: Server = build(true)
+    r = srv.inject("POST", "/small", big)
+    print(f"inject-server-handler: {detail(r.status, r.header('Content-Type'), r.body)} hooks={hooks()}")
+    r = srv.inject("POST", "/orders/7", "123456789", {"X-Trace": "t-1"})
+    print(f"inject-route-handler: {detail(r.status, r.header('Content-Type'), r.body)}")
+    r = srv.inject("POST", "/big", big)
+    print(f"inject-route-limit-beats-server: {r.status}")
+    r = srv.inject("POST", "/small", "tiny")
+    print(f"inject-within-limit: {r.status} {r.body}")
+    r = srv.inject("POST", "/nowhere", big)
+    print(f"inject-unmatched-path: {detail(r.status, r.header('Content-Type'), r.body)}")
+    _ = hooks()
+
+    quiet: Server = build(false)
+    quiet.setPayloadTooLargeHandler(notSending)
+    r = quiet.inject("POST", "/small", big)
+    print(f"inject-not-sent: {detail(r.status, r.header('Content-Type'), r.body)} retry={r.header('Retry-After')}")
+    crash: Server = build(false)
+    crash.setPayloadTooLargeHandler(panicking)
+    r = crash.inject("POST", "/small", big)
+    print(f"inject-panicking: {detail(r.status, r.header('Content-Type'), r.body)}")
+    r = srv.inject("POST", "/stream", big)
+    print(f"inject-streamed: {detail(r.status, r.header('Content-Type'), r.body)}")
+    r = srv.inject("POST", "/stream-raise", big)
+    print(f"inject-streamed-httperror: {detail(r.status, r.header('Content-Type'), r.body)}")
+    r = plain.inject("POST", "/stream-raise", big)
+    print(f"inject-streamed-default: {r.status} {r.header('Content-Type')}")
+    r = srv.inject("POST", "/stream", "abcde")
+    print(f"inject-streamed-small: {r.status} {r.body}")
+    _ = hooks()
+
+    # The same servers over real listeners.
+    _ = plain.listenBackground(0).unwrap()
+    _ = srv.listenBackground(0).unwrap()
+    plainAddress: str = plain.boundAddr
+    address: str = srv.boundAddr
+    func call(base: str, path: str, body: str, trace: str) -> str {
+        status: int = 0
+        contentType: str = ""
+        text: str = ""
+        go! {
+            req, _ := http.NewRequest("POST", "http://"+base+path, strings.NewReader(body))
+            if trace != "" {
+                req.Header.Set("X-Trace", trace)
+            }
+            resp, err := http.DefaultClient.Do(req)
+            if err == nil {
+                data, _ := io.ReadAll(resp.Body)
+                resp.Body.Close()
+                status = resp.StatusCode
+                contentType = resp.Header.Get("Content-Type")
+                text = string(data)
+            } else {
+                text = err.Error()
+            }
+        }
+        return detail(status, contentType, text)
+    }
+    print(f"http-default: {call(plainAddress, '/small', big, '')} hooks={hooks()}")
+    print(f"http-server-handler: {call(address, '/small', big, '')} hooks={hooks()}")
+    print(f"http-route-handler: {call(address, '/orders/7', '123456789', 't-1')}")
+    print(f"http-route-limit-beats-server: {call(address, '/big', big, '').split(' ')[0]}")
+    print(f"http-within-limit: {call(address, '/small', 'tiny', '')}")
+    print(f"http-streamed: {call(address, '/stream', big, '')}")
+    print(f"http-streamed-httperror: {call(address, '/stream-raise', big, '')}")
+    print(f"http-streamed-default: {call(plainAddress, '/stream-raise', big, '').split(' ')[0]}")
+    print(f"http-streamed-small: {call(address, '/stream', 'abcde', '')}")
+    plain.close()
+    srv.close()
+}
+
+go! {
+    import (
+        "io"
+        "net/http"
+        "strings"
+        "sync/atomic"
+    )
+
+    var lamTestHookCount atomic.Int64
+}

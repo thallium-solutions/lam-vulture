@@ -1,0 +1,222 @@
+# Test: structured schema issues (SchemaIssue) and srv.setSchemaIssueHandler.
+#
+# The handler gets where the validation failed, every issue (field path,
+# JSON Schema keyword, message, offending value) and writes the response
+# itself: status, headers and Content-Type (application/problem+json).
+# required / additionalProperties name the missing / extra property.
+# setSchemaErrorFormatter keeps its behaviour; the handler wins when both
+# are installed, and a handler that sends nothing (or panics) falls back.
+#
+# expect: required: 422 application/problem+json body name:required:-
+# expect: nested-required: body items.0.size:required:-
+# expect: type: body price:type:"abc"
+# expect: enum: body color:enum:"pink"
+# expect: minimum: body price:minimum:-1
+# expect: additional: body extra:additionalProperties:true
+# expect: root-type: body :type:[1,2]
+# expect: many-sorted: body color:enum:"x" items.0.size:type:"L" name:required:-
+# expect: nested-additional: body items.1.bogus:additionalProperties:1
+# expect: maxLength-pattern: body code:maxLength:"ABCDEF" code:pattern:"ABCDEF"
+# expect: querystring: querystring page:pattern:"x"
+# expect: params: params id:pattern:"abc"
+# expect: headers: headers x-api-key:required:-
+# expect: shared-ref: body owner:pattern:"nope"
+# expect: malformed-json: body :parse:-
+# expect: yaml: body name:minLength:"A"
+# expect: issue-json: {"field":"price","keyword":"minimum","message":"Must be greater than or equal to 0","value":-1}
+# expect: issue-json-no-value: {"field":"name","keyword":"required","message":"name is required"}
+# expect: message: name is required
+# expect: req-visible: POST /orders application/json
+# expect: valid-passes: 200 ok
+# expect: not-sent-falls-back-to-formatter: 400 application/json; charset=utf-8 formatted
+# expect: panicking-falls-back: 400 application/json; charset=utf-8 validation failed: body
+# expect: formatter-only: 400 application/json; charset=utf-8 formatted
+# expect: formatter-text: 400 text/plain; charset=utf-8 plain
+# expect: default-envelope: 400 application/json; charset=utf-8 ["name is required"]
+# expect: http: 422 application/problem+json name:required
+
+from lamjson import Json
+from @lam/vulture import InjectResponse, Request, Response, RouteOptions, SchemaIssue, Server
+
+func ok(_req: Request, _res: Response) -> str {
+    return "ok"
+}
+
+func describe(issue: SchemaIssue) -> str {
+    value: str = "-"
+    if issue.hasValue {
+        value = Json.encode(issue.value).unwrap()
+    }
+    return f"{issue.field}:{issue.keyword}:{value}"
+}
+
+func problems(where: str, issues: list[SchemaIssue], _req: Request, res: Response) {
+    parts: list[str] = [describe(issue) for issue in issues]
+    errors: list[json] = [json(issue) for issue in issues]
+    doc: json = {"type": "about:blank", "title": "Unprocessable", "where": where, "errors": errors, "summary": " ".join(parts)}
+    _ = res.code(422).type_("application/problem+json").send(Json.encode(doc).unwrap())
+}
+
+func silent(_where: str, _issues: list[SchemaIssue], _req: Request, res: Response) {
+    _ = res.header("X-Seen", "yes")
+}
+
+func panicking(_where: str, _issues: list[SchemaIssue], _req: Request, _res: Response) {
+    throw "boom"
+}
+
+func formatter(_where: str, _errs: list[str], _req: Request) -> any {
+    return {"formatted": true}
+}
+
+func textFormatter(_where: str, _errs: list[str], _req: Request) -> any {
+    return "plain"
+}
+
+func orderSchema() -> dict[str, any] {
+    return {
+        "type": "object",
+        "required": ["name"],
+        "additionalProperties": false,
+        "properties": {
+            "name": {"type": "string"},
+            "price": {"type": "number", "minimum": 0},
+            "color": {"enum": ["red", "blue"]},
+            "code": {"type": "string", "maxLength": 4, "pattern": "^[a-z]+$"},
+            "owner": {"$ref": "uuid"},
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["size"],
+                    "additionalProperties": false,
+                    "properties": {"size": {"type": "integer"}},
+                },
+            },
+        },
+    }
+}
+
+func post(srv: Server, body: str) -> InjectResponse {
+    return srv.inject("POST", "/orders", body, {"Content-Type": "application/json"})
+}
+
+func summary(r: InjectResponse) -> str {
+    parsed: json = Json.decode(r.body).unwrap()
+    where: str = parsed["where"]
+    text: str = parsed["summary"]
+    return f"{where} {text}"
+}
+
+func makeServer() -> Server {
+    srv: Server = Server()
+    srv.addSchema({"$id": "uuid", "type": "string", "pattern": "^[0-9a-f-]{36}$"})
+    srv.post("/orders", ok, RouteOptions().withSchema({"body": orderSchema()}))
+    srv.get("/search", ok, RouteOptions().withSchema({"querystring": {"type": "object", "properties": {"page": {"type": "string", "pattern": "^[0-9]+$"}}}}))
+    srv.get("/things/:id", ok, RouteOptions().withSchema({"params": {"type": "object", "properties": {"id": {"type": "string", "pattern": "^[0-9]+$"}}}}))
+    srv.get("/secure", ok, RouteOptions().withSchema({"headers": {"type": "object", "required": ["x-api-key"]}}))
+    yamlSchema: str = "type: object\nproperties:\n  name:\n    type: string\n    minLength: 2\n"
+    srv.post("/yaml", ok, yamlSchema, "yaml")
+    return srv
+}
+
+func main() {
+    srv: Server = makeServer()
+    srv.setSchemaIssueHandler(problems)
+
+    r: InjectResponse = post(srv, "{}")
+    print(f"required: {r.status} {r.header('Content-Type')} {summary(r)}")
+    func show(label: str, body: str) {
+        print(label + ": " + summary(post(srv, body)))
+    }
+    show("nested-required", '{"name": "a", "items": [{}]}')
+    show("type", '{"name": "a", "price": "abc"}')
+    show("enum", '{"name": "a", "color": "pink"}')
+    show("minimum", '{"name": "a", "price": -1}')
+    show("additional", '{"name": "a", "extra": true}')
+    show("root-type", "[1, 2]")
+    show("many-sorted", '{"color": "x", "items": [{"size": "L"}]}')
+    show("nested-additional", '{"name": "a", "items": [{"size": 1}, {"size": 2, "bogus": 1}]}')
+    show("maxLength-pattern", '{"name": "a", "code": "ABCDEF"}')
+    print("querystring: " + summary(srv.inject("GET", "/search?page=x")))
+    print("params: " + summary(srv.inject("GET", "/things/abc")))
+    print("headers: " + summary(srv.inject("GET", "/secure")))
+    show("shared-ref", '{"name": "a", "owner": "nope"}')
+    truncated: str = "{" + '"name": '
+    print("malformed-json: " + summary(srv.inject("POST", "/orders", truncated, {"Content-Type": "text/x-unknown"})))
+    print("yaml: " + summary(srv.inject("POST", "/yaml", "name: A\n")))
+
+    # SchemaIssue values: __json__, message, value presence.
+    minimum: SchemaIssue = SchemaIssue("price", "minimum", "Must be greater than or equal to 0", -1, true)
+    print(f"issue-json: {Json.encode(json(minimum)).unwrap()}")
+    required: SchemaIssue = SchemaIssue("name", "required", "name is required")
+    print(f"issue-json-no-value: {Json.encode(json(required)).unwrap()}")
+
+    captured: list[SchemaIssue] = []
+    probe: Server = makeServer()
+    func capture(_where: str, issues: list[SchemaIssue], req: Request, res: Response) {
+        for issue in issues {
+            captured.append(issue)
+        }
+        _ = res.code(400).text(f"{req.method} {req.path} {req.header('Content-Type')}")
+    }
+    probe.setSchemaIssueHandler(capture)
+    seen: InjectResponse = post(probe, "{}")
+    print(f"message: {captured[0].message}")
+    print(f"req-visible: {seen.body}")
+    valid: InjectResponse = post(probe, "{\"name\": \"ok\"}")
+    print(f"valid-passes: {valid.status} {valid.body}")
+
+    fallback: Server = makeServer()
+    fallback.setSchemaErrorFormatter(formatter)
+    fallback.setSchemaIssueHandler(silent)
+    r = post(fallback, "{}")
+    print(f"not-sent-falls-back-to-formatter: {r.status} {r.header('Content-Type')} {'formatted' if r.body.contains('formatted') else r.body}")
+
+    crash: Server = makeServer()
+    crash.setSchemaIssueHandler(panicking)
+    r = post(crash, "{}")
+    parsed: json = Json.decode(r.body).unwrap()
+    message: str = parsed["message"]
+    print(f"panicking-falls-back: {r.status} {r.header('Content-Type')} {message}")
+
+    old: Server = makeServer()
+    old.setSchemaErrorFormatter(formatter)
+    r = post(old, "{}")
+    print(f"formatter-only: {r.status} {r.header('Content-Type')} {'formatted' if r.body.contains('formatted') else r.body}")
+    old.setSchemaErrorFormatter(textFormatter)
+    r = post(old, "{}")
+    print(f"formatter-text: {r.status} {r.header('Content-Type')} {r.body}")
+    old.clearSchemaErrorFormatter()
+    r = post(old, "{}")
+    envelope: json = Json.decode(r.body).unwrap()
+    print(f"default-envelope: {r.status} {r.header('Content-Type')} {Json.encode(envelope['validation']).unwrap()}")
+
+    # Over a real listener.
+    _ = srv.listenBackground(0).unwrap()
+    address: str = srv.boundAddr
+    status: int = 0
+    contentType: str = ""
+    body: str = ""
+    go! {
+        resp, err := http.Post("http://"+address+"/orders", "application/json", strings.NewReader("{}"))
+        if err == nil {
+            data, _ := io.ReadAll(resp.Body)
+            resp.Body.Close()
+            status = resp.StatusCode
+            contentType = resp.Header.Get("Content-Type")
+            body = string(data)
+        }
+    }
+    srv.close()
+    first: str = "name:required" if body.contains("name:required") else body
+    print(f"http: {status} {contentType} {first}")
+}
+
+go! {
+    import (
+        "io"
+        "net/http"
+        "strings"
+    )
+}

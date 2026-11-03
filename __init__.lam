@@ -78,6 +78,7 @@ go! {
         "net/url"
         "os"
         "path/filepath"
+        "reflect"
         "slices"
         "strconv"
         "strings"
@@ -112,6 +113,7 @@ go! {
         OnSend           interface{} // func(*Request, *Response)
         OnResponse       interface{} // func(*Request, *Response), runs before global onResponse hooks
         OnError          interface{} // func(*Request, *Response, interface{}), route-level error hook
+        PayloadTooLarge  interface{} // func(*Request, *Response), shapes the route's 413 (wins over the server's)
         // Fastify-style schema. Each entry is the raw schema *text*
         // (so authors can paste JSON Schema as-is); we compile lazily
         // on first request. “ResponseSchemas“ is keyed by status
@@ -199,6 +201,7 @@ go! {
                 OnSend:           typed.OnSendHook,
                 OnResponse:       typed.OnResponseHook,
                 OnError:          typed.OnErrorHook,
+                PayloadTooLarge:  typed.PayloadTooLargeHook,
                 SchemaFormat:     typed.SchemaFormat,
                 OperationId:      typed.OperationId,
                 Summary:          typed.Summary,
@@ -257,6 +260,8 @@ go! {
                 out.OnResponse = v
             case "onerror":
                 out.OnError = v
+            case "onpayloadtoolarge":
+                out.PayloadTooLarge = v
             case "operationid":
                 if s, ok := v.(string); ok {
                     out.OperationId = s
@@ -325,6 +330,13 @@ go! {
     // value may be a JSON-encoded string or a nested map; maps are
     // re-serialised so the on-wire compiler sees JSON Schema text.
     func lamPopulateSchemaSlots(out *lamRouteOpts, raw interface{}) {
+        switch raw.(type) {
+        case LamJSON, *LamJSON, map[string]interface{}:
+            // Native json values (also nested in a dict) become maps.
+            if normalized, err := lamJSONNormalize(raw, 0); err == nil {
+                raw = normalized
+            }
+        }
         m, ok := raw.(map[string]interface{})
         if !ok {
             return
@@ -968,23 +980,184 @@ go! {
     // “{"$ref": "<id>"}“ lookups by $id. Fragment refs
     // (“#/definitions/foo“) are passed through to gojsonschema,
     // which resolves them natively against the top-level schema.
+    //
+    // An id may be referenced any number of times (siblings, array
+    // items, nested shared schemas): cycle detection follows the
+    // current reference path only, so a cycle is an id that refers
+    // back to itself through its own expansion. Recursive schemas
+    // cannot be inlined: “addSchema“ and route registration refuse
+    // them (“SchemaRefCycleError“); a cycle met at request time
+    // (the registry mutated directly) panics, which the dispatcher
+    // turns into a 500.
     func lamResolveSchemaRefs(text string, shared map[string]string) string {
+        resolved, err := lamResolveSchemaRefsChecked(text, shared)
+        if err != nil {
+            panic(err.Error())
+        }
+        return resolved
+    }
+
+    // lamResolveSchemaRefsChecked is “lamResolveSchemaRefs“ with the
+    // cycle reported as an error. Text that is not JSON is returned
+    // unchanged (the compiler reports it).
+    func lamResolveSchemaRefsChecked(text string, shared map[string]string) (string, error) {
         if text == "" || len(shared) == 0 {
-            return text
+            return text, nil
         }
         if !strings.Contains(text, "$ref") {
-            return text
+            return text, nil
         }
         var doc interface{}
         if err := json.Unmarshal([]byte(text), &doc); err != nil {
-            return text
+            return text, nil
         }
-        resolved := lamWalkRefs(doc, shared, map[string]bool{})
+        resolved, err := lamWalkRefs(doc, shared, nil)
+        if err != nil {
+            return "", err
+        }
         b, err := json.Marshal(resolved)
         if err != nil {
-            return text
+            return text, nil
         }
-        return string(b)
+        return string(b), nil
+    }
+
+    // lamSharedSchemaCycle reports a $ref cycle reachable from the
+    // shared schema “id“.
+    func lamSharedSchemaCycle(shared map[string]string, id string) error {
+        _, err := lamWalkRefs(map[string]interface{}{"$ref": id}, shared, nil)
+        return err
+    }
+
+    // lamSchemaObject turns a schema given as JSON text, a Lam dict or
+    // a native “json“ value into a JSON object. Anything else (and
+    // non-object JSON) is a “SchemaTypeError“; malformed text is a
+    // “SchemaParseError“.
+    func lamSchemaObject(raw interface{}, what string) (map[string]interface{}, error) {
+        var value interface{}
+        switch v := raw.(type) {
+        case string:
+            if err := json.Unmarshal([]byte(v), &value); err != nil {
+                return nil, fmt.Errorf("SchemaParseError: %s: schema is not valid JSON: %v", what, err)
+            }
+        case LamJSON, *LamJSON, map[string]interface{}:
+            normalized, err := lamJSONNormalize(v, 0)
+            if err != nil {
+                return nil, fmt.Errorf("SchemaTypeError: %s: %v", what, err)
+            }
+            value = normalized
+        default:
+            return nil, fmt.Errorf("SchemaTypeError: %s expects a JSON object (json, dict or JSON text), got %s", what, lamSchemaKind(raw))
+        }
+        obj, ok := value.(map[string]interface{})
+        if !ok {
+            return nil, fmt.Errorf("SchemaTypeError: %s expects a JSON object, got %s", what, lamSchemaKind(value))
+        }
+        return obj, nil
+    }
+
+    // lamSchemaKind names the JSON kind of a value for error messages.
+    func lamSchemaKind(value interface{}) string {
+        switch v := value.(type) {
+        case nil:
+            return "null"
+        case LamJSON:
+            return "json " + lamSchemaKind(lamJSONRaw(v))
+        case *LamJSON:
+            if v == nil {
+                return "null"
+            }
+            return "json " + lamSchemaKind(lamJSONRaw(*v))
+        case bool:
+            return "boolean"
+        case string:
+            return "string"
+        case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, json.Number:
+            return "number"
+        case []interface{}:
+            return "array"
+        case map[string]interface{}:
+            return "object"
+        }
+        return fmt.Sprintf("%T", value)
+    }
+
+    // lamCheckSchemaSlot validates one schema slot (“body“,
+    // “querystring“, ...): an object, a boolean schema, JSON text
+    // (any text for YAML / XML bodies) or nothing.
+    func lamCheckSchemaSlot(value interface{}, slot string, format string) error {
+        switch v := value.(type) {
+        case nil, bool, map[string]interface{}:
+            return nil
+        case string:
+            if format != "" && format != "json" {
+                return nil
+            }
+            var probe interface{}
+            if err := json.Unmarshal([]byte(v), &probe); err != nil {
+                return fmt.Errorf("SchemaParseError: the %s schema is not valid JSON: %v", slot, err)
+            }
+            switch probe.(type) {
+            case map[string]interface{}, bool:
+                return nil
+            }
+            return fmt.Errorf("SchemaTypeError: the %s schema must be a JSON object, got %s", slot, lamSchemaKind(probe))
+        }
+        return fmt.Errorf("SchemaTypeError: the %s schema must be a JSON object, got %s", slot, lamSchemaKind(value))
+    }
+
+    // lamNormalizeSchemaSlots validates the Fastify-style schema map of
+    // “RouteOptions.withSchema“ (“body“, “querystring“ / “query“,
+    // “params“, “headers“, “response“ by status) and returns it
+    // with every native “json“ value turned into plain maps.
+    func lamNormalizeSchemaSlots(raw interface{}, format string) (map[string]interface{}, error) {
+        obj, err := lamSchemaObject(raw, "RouteOptions.withSchema")
+        if err != nil {
+            return nil, err
+        }
+        for key, value := range obj {
+            switch strings.ToLower(key) {
+            case "body":
+                if err := lamCheckSchemaSlot(value, "body", format); err != nil {
+                    return nil, err
+                }
+            case "querystring", "query", "params", "headers":
+                if err := lamCheckSchemaSlot(value, strings.ToLower(key), "json"); err != nil {
+                    return nil, err
+                }
+            case "response":
+                codes, ok := value.(map[string]interface{})
+                if !ok {
+                    return nil, fmt.Errorf("SchemaTypeError: the response schemas must be an object keyed by status, got %s", lamSchemaKind(value))
+                }
+                for code, sub := range codes {
+                    if err := lamCheckSchemaSlot(sub, "response "+code, "json"); err != nil {
+                        return nil, err
+                    }
+                }
+            }
+        }
+        return obj, nil
+    }
+
+    // lamCheckRouteSchemaRefs refuses, at route registration, a route
+    // schema whose shared references form a cycle.
+    func lamCheckRouteSchemaRefs(opts *lamRouteOpts, shared map[string]string) {
+        if opts == nil {
+            return
+        }
+        texts := []string{opts.QuerySchema, opts.ParamsSchema, opts.HeadersSchema}
+        if opts.SchemaFormat == "" || opts.SchemaFormat == "json" {
+            texts = append(texts, opts.BodySchema)
+        }
+        for _, text := range opts.ResponseSchemas {
+            texts = append(texts, text)
+        }
+        for _, text := range texts {
+            if _, err := lamResolveSchemaRefsChecked(text, shared); err != nil {
+                panic(err.Error())
+            }
+        }
     }
 
     func lamMissingSharedSchemaRef(text string, shared map[string]string) bool {
@@ -1018,47 +1191,233 @@ go! {
         return missing(schema)
     }
 
-    func lamWalkRefs(v interface{}, shared map[string]string,
-        seen map[string]bool) interface{} {
+    // lamWalkRefs inlines the shared schemas referenced by “v“.
+    // “path“ holds the ids being expanded around “v“ (outermost
+    // first): only an id already on that path is a cycle, so the
+    // same id may be inlined at any number of places.
+    func lamWalkRefs(v interface{}, shared map[string]string, path []string) (interface{}, error) {
         switch x := v.(type) {
         case map[string]interface{}:
             if refId, ok := x["$ref"].(string); ok && refId != "" &&
                 !strings.HasPrefix(refId, "#") {
                 if sharedText, has := shared[refId]; has {
-                    if seen[refId] {
-                        // Cycle — leave the ref alone and let
-                        // gojsonschema error on compile.
-                        return x
+                    for i, id := range path {
+                        if id == refId {
+                            chain := append(append([]string{}, path[i:]...), refId)
+                            return nil, fmt.Errorf("SchemaRefCycleError: shared schema $ref cycle: %s (a recursive schema cannot be inlined)", strings.Join(chain, " -> "))
+                        }
                     }
-                    seen[refId] = true
                     var sub interface{}
                     if err := json.Unmarshal([]byte(sharedText), &sub); err == nil {
-                        resolved := lamWalkRefs(sub, shared, seen)
+                        inner := append(append(make([]string, 0, len(path)+1), path...), refId)
+                        resolved, err := lamWalkRefs(sub, shared, inner)
+                        if err != nil {
+                            return nil, err
+                        }
                         // Strip “$id“ from the inlined shared
                         // schema so gojsonschema doesn't think it's
                         // a nested top-level schema.
                         if m, ok := resolved.(map[string]interface{}); ok {
                             delete(m, "$id")
-                            return m
+                            return m, nil
                         }
-                        return resolved
+                        return resolved, nil
                     }
-                    delete(seen, refId)
                 }
             }
             out := make(map[string]interface{}, len(x))
             for k, vv := range x {
-                out[k] = lamWalkRefs(vv, shared, seen)
+                resolved, err := lamWalkRefs(vv, shared, path)
+                if err != nil {
+                    return nil, err
+                }
+                out[k] = resolved
             }
-            return out
+            return out, nil
         case []interface{}:
             out := make([]interface{}, len(x))
             for i, item := range x {
-                out[i] = lamWalkRefs(item, shared, seen)
+                resolved, err := lamWalkRefs(item, shared, path)
+                if err != nil {
+                    return nil, err
+                }
+                out[i] = resolved
             }
+            return out, nil
+        }
+        return v, nil
+    }
+
+    // ─── Structured schema issues ───────────────────────────
+    // gojsonschema error types → JSON Schema keywords.
+    var lamSchemaKeywords = map[string]string{
+        "false":                           "false",
+        "required":                        "required",
+        "invalid_type":                    "type",
+        "number_any_of":                   "anyOf",
+        "number_one_of":                   "oneOf",
+        "number_all_of":                   "allOf",
+        "number_not":                      "not",
+        "missing_dependency":              "dependencies",
+        "internal":                        "internal",
+        "const":                           "const",
+        "enum":                            "enum",
+        "array_no_additional_items":       "additionalItems",
+        "array_min_items":                 "minItems",
+        "array_max_items":                 "maxItems",
+        "unique":                          "uniqueItems",
+        "contains":                        "contains",
+        "array_min_properties":            "minProperties",
+        "array_max_properties":            "maxProperties",
+        "additional_property_not_allowed": "additionalProperties",
+        "invalid_property_pattern":        "patternProperties",
+        "invalid_property_name":           "propertyNames",
+        "string_gte":                      "minLength",
+        "string_lte":                      "maxLength",
+        "pattern":                         "pattern",
+        "format":                          "format",
+        "multiple_of":                     "multipleOf",
+        "number_gte":                      "minimum",
+        "number_gt":                       "exclusiveMinimum",
+        "number_lte":                      "maximum",
+        "number_lt":                       "exclusiveMaximum",
+        "condition_then":                  "then",
+        "condition_else":                  "else",
+    }
+
+    // lamSchemaDetail reads a string entry of a gojsonschema
+    // “ErrorDetails“ (a named map type) without importing it.
+    func lamSchemaDetail(details interface{}, key string) string {
+        rv := reflect.ValueOf(details)
+        if !rv.IsValid() || rv.Kind() != reflect.Map || rv.Type().Key().Kind() != reflect.String {
+            return ""
+        }
+        item := rv.MapIndex(reflect.ValueOf(key).Convert(rv.Type().Key()))
+        if !item.IsValid() {
+            return ""
+        }
+        if s, ok := item.Interface().(string); ok {
+            return s
+        }
+        return fmt.Sprint(item.Interface())
+    }
+
+    func lamJoinIssueField(parent, name string) string {
+        if parent == "" {
+            return name
+        }
+        if name == "" {
+            return parent
+        }
+        return parent + "." + name
+    }
+
+    // lamCompareIssueFields orders dotted paths segment by segment,
+    // numeric segments (array indexes) by value: items.2 < items.10.
+    func lamCompareIssueFields(a, b string) int {
+        if a == b {
+            return 0
+        }
+        if a == "" {
+            return -1
+        }
+        if b == "" {
+            return 1
+        }
+        as := strings.Split(a, ".")
+        bs := strings.Split(b, ".")
+        for i := 0; i < len(as) && i < len(bs); i++ {
+            if as[i] == bs[i] {
+                continue
+            }
+            an, aerr := strconv.Atoi(as[i])
+            bn, berr := strconv.Atoi(bs[i])
+            if aerr == nil && berr == nil {
+                if an < bn {
+                    return -1
+                }
+                return 1
+            }
+            return strings.Compare(as[i], bs[i])
+        }
+        return len(as) - len(bs)
+    }
+
+    // lamBuildSchemaIssues turns a lamschema failure into
+    // “SchemaIssue“ values sorted by field, then keyword. Fields are
+    // dotted paths (“items.0.size“, “""“ for the document itself);
+    // “required“ / “additionalProperties“ / “dependencies“ /
+    // “propertyNames“ name the missing or offending property. A
+    // failure without per-field issues (a malformed document, a schema
+    // that does not compile, XSD errors) gives root issues.
+    func lamBuildSchemaIssues(failure *lamSchemaFailure) []*SchemaIssue {
+        out := []*SchemaIssue{}
+        if failure == nil {
             return out
         }
-        return v
+        if raw, ok := failure.cause.([]interface{}); ok {
+            for _, entry := range raw {
+                issue, ok := entry.(map[string]interface{})
+                if !ok {
+                    continue
+                }
+                message, _ := issue["description"].(string)
+                kind, hasKind := issue["keyword"].(string)
+                if !hasKind {
+                    out = append(out, NewSchemaIssue("", "xsd", message, lamJSONWrapRaw(nil), false))
+                    continue
+                }
+                field, _ := issue["field"].(string)
+                if field == "(root)" {
+                    field = ""
+                }
+                keyword, known := lamSchemaKeywords[kind]
+                if !known {
+                    keyword = kind
+                }
+                value := issue["value"]
+                hasValue := true
+                details := issue["details"]
+                switch kind {
+                case "required":
+                    field = lamJoinIssueField(field, lamSchemaDetail(details, "property"))
+                    value, hasValue = nil, false
+                case "missing_dependency":
+                    field = lamJoinIssueField(field, lamSchemaDetail(details, "dependency"))
+                    value, hasValue = nil, false
+                case "additional_property_not_allowed":
+                    field = lamJoinIssueField(field, lamSchemaDetail(details, "property"))
+                case "invalid_property_name":
+                    name := lamSchemaDetail(details, "property")
+                    field = lamJoinIssueField(field, name)
+                    value = name
+                }
+                normalized, err := lamJSONNormalize(value, 0)
+                if err != nil {
+                    normalized, hasValue = nil, false
+                }
+                out = append(out, NewSchemaIssue(field, keyword, message, lamJSONWrapRaw(normalized), hasValue))
+            }
+        }
+        if len(out) == 0 {
+            keyword := "invalid"
+            switch failure.kind {
+            case "SchemaParseError":
+                keyword = "parse"
+            case "SchemaCompileError":
+                keyword = "schema"
+            case "SchemaFormatError":
+                keyword = "schemaFormat"
+            }
+            out = append(out, NewSchemaIssue("", keyword, failure.message, lamJSONWrapRaw(nil), false))
+        }
+        slices.SortStableFunc(out, func(a, b *SchemaIssue) int {
+            if c := lamCompareIssueFields(a.Field, b.Field); c != 0 {
+                return c
+            }
+            return strings.Compare(a.Keyword, b.Keyword)
+        })
+        return out
     }
 
     // ─── OpenAPI helpers ───────────────────────────────────
@@ -1173,6 +1532,50 @@ go! {
             out[k] = v
         }
         return out
+    }
+
+    // lamQueryForSchemaText is the querystring document validated
+    // against the (resolved) schema “schemaText“: a parameter whose
+    // property schema has type "array" (or a type list containing
+    // it) is every value of the parameter (“?brand=a&brand=b“ →
+    // ["a", "b"]); any other parameter is its first value.
+    func lamQueryForSchemaText(m map[string]string, multi map[string][]string, schemaText string) map[string]interface{} {
+        out := lamQueryForSchema(m)
+        props := lamSchemaProperties(schemaText)
+        for name, raw := range props {
+            prop, ok := raw.(map[string]interface{})
+            if !ok || !lamSchemaAllowsArray(prop["type"]) {
+                continue
+            }
+            values, ok := multi[name]
+            if !ok {
+                if first, has := m[name]; has {
+                    values = []string{first}
+                } else {
+                    continue
+                }
+            }
+            items := make([]interface{}, len(values))
+            for i, value := range values {
+                items[i] = value
+            }
+            out[name] = items
+        }
+        return out
+    }
+
+    func lamSchemaAllowsArray(kind interface{}) bool {
+        switch v := kind.(type) {
+        case string:
+            return v == "array"
+        case []interface{}:
+            for _, item := range v {
+                if s, ok := item.(string); ok && s == "array" {
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     // ─── Request-ID helper ─────────────────────────────────
@@ -2810,6 +3213,57 @@ class SseEmitter {
     }
 }
 
+class SchemaIssue {
+    #- One schema-validation failure, as given to the handler of
+    ``Server.setSchemaIssueHandler``.
+
+    * ``field`` — dotted path of the offending value inside the validated
+      document: ``"price"``, ``"items.0.size"``, ``""`` for the document
+      itself. For ``required`` (and ``dependencies``) it names the missing
+      property, for ``additionalProperties`` (and ``propertyNames``) the
+      extra one. Params are named without ``:`` (``"id"``), headers in
+      lower case.
+    * ``keyword`` — the JSON Schema keyword that failed: ``required``,
+      ``type``, ``enum``, ``const``, ``minimum``, ``maximum``,
+      ``exclusiveMinimum``, ``exclusiveMaximum``, ``multipleOf``,
+      ``minLength``, ``maxLength``, ``pattern``, ``format``, ``minItems``,
+      ``maxItems``, ``uniqueItems``, ``contains``, ``additionalItems``,
+      ``minProperties``, ``maxProperties``, ``additionalProperties``,
+      ``patternProperties``, ``propertyNames``, ``dependencies``,
+      ``anyOf``, ``oneOf``, ``allOf``, ``not``, ``then``, ``else``. A
+      document that cannot be parsed is ``parse``, a schema that does not
+      compile ``schema``, an XSD failure ``xsd``.
+    * ``message`` — the validator's description (the strings
+      ``setSchemaErrorFormatter`` receives).
+    * ``value`` / ``hasValue`` — the offending value, when there is one
+      (``required`` has none). -#
+
+    func init(self, field: str = "", keyword: str = "", message: str = "", value: json = None, hasValue: bool = false) {
+        self.field: str = field
+        self.keyword: str = keyword
+        self.message: str = message
+        self.value: json = value
+        self.hasValue: bool = hasValue
+    }
+
+    func __json__(self) -> json {
+        #- ``{"field", "keyword", "message", "value"}``; ``value`` only
+        when ``hasValue``. -#
+        out: json = {"field": self.field, "keyword": self.keyword, "message": self.message}
+        if self.hasValue {
+            out["value"] = self.value
+        }
+        return out
+    }
+
+    func __str__(self) -> str {
+        if self.field == "" {
+            return f"{self.keyword}: {self.message}"
+        }
+        return f"{self.field}: {self.keyword}: {self.message}"
+    }
+}
+
 class RouteOptions {
     #- Typed per-route configuration used by the ``route`` and verb-helper
     overloads. Schema values and metadata remain ``any`` because JSON Schema
@@ -2840,12 +3294,37 @@ class RouteOptions {
         self.onSendHook: any = None
         self.onResponseHook: any = None
         self.onErrorHook: any = None
+        self.payloadTooLargeHook: any = None
     }
 
     func withSchema(self, schema: any, format: str = "json") -> RouteOptions {
-        #- Attach the heterogeneous JSON/YAML/XML schema tree. -#
-        self.schemaValue = schema
+        #- Attach the Fastify-style schema map: ``body``, ``querystring``
+        (or ``query``), ``params``, ``headers`` and ``response`` (keyed by
+        status). The map and each schema may be a native ``json`` object, a
+        ``dict`` or JSON text (a YAML / XML ``body`` schema is text, with
+        ``format`` ``"yaml"`` / ``"xml"``). Anything else — a non-object
+        ``json`` value, a number, malformed JSON text — raises
+        ``SchemaTypeError`` / ``SchemaParseError`` here instead of being
+        ignored. ``None`` removes the schema. -#
+        normalized: any = None
+        go! {
+            if schema != nil {
+                slots, err := lamNormalizeSchemaSlots(schema, format)
+                if err != nil {
+                    panic(err.Error())
+                }
+                normalized = slots
+            }
+        }
+        self.schemaValue = normalized
         self.schemaFormat = format
+        return self
+    }
+
+    func onPayloadTooLarge(self, handler: func(Request, Response)) -> RouteOptions {
+        #- Shape this route's ``413 Payload Too Large`` response; wins over
+        ``Server.setPayloadTooLargeHandler``. See that method. -#
+        self.payloadTooLargeHook = handler
         return self
     }
 
@@ -2961,8 +3440,9 @@ class Server {
         # Maximum allowed request body size in bytes. ``0`` is the
         # historical default (no limit). When set, oversized POSTs
         # are rejected with ``413 Payload Too Large`` *before* any
-        # hook runs. Apply on the entire chain or on a per-route
-        # basis from a ``preHandler`` hook.
+        # hook runs (over HTTP and through ``inject``). A route's
+        # ``RouteOptions.bodyLimit`` overrides it;
+        # ``setPayloadTooLargeHandler`` shapes the 413.
         self.bodyLimit: int = 0
         # ``trustProxyHeaders`` is empty by default — every request's
         # ``realIP()`` returns the direct peer's address. Call
@@ -3001,6 +3481,13 @@ class Server {
         # dict (serialised to JSON) or a str (used verbatim with
         # ``Content-Type: text/plain``).
         self.schemaErrorFormatter: any = None
+        # Optional ``func(where: str, issues: list[SchemaIssue],
+        # req: Request, res: Response)`` that writes the whole 400
+        # response itself; wins over ``schemaErrorFormatter``.
+        self.schemaIssueHandler: any = None
+        # Optional ``func(req: Request, res: Response)`` shaping every
+        # ``413 Payload Too Large`` (route ``onPayloadTooLarge`` wins).
+        self.payloadTooLargeHandler: any = None
         # ``onRequestAbort`` hooks fire when the HTTP client
         # disconnects before the handler completed (via
         # ``r.Context().Done()``). Signature:
@@ -3106,8 +3593,17 @@ class Server {
                 "schemaFormat": schemaFormat,
             })
             if schemaFormat == "json" {
-                if _, failure := lamSchemaCompileText(opts.BodySchema); failure != nil {
-                    panic(failure.kind + ": " + failure.message)
+                // Shared schemas are inlined first; a schema still
+                // referencing an id not registered yet compiles at the
+                // first request instead.
+                resolved, err := lamResolveSchemaRefsChecked(opts.BodySchema, s.SharedSchemas)
+                if err != nil {
+                    panic(err.Error())
+                }
+                if !lamMissingSharedSchemaRef(resolved, s.SharedSchemas) {
+                    if _, failure := lamSchemaCompileText(resolved); failure != nil {
+                        panic(failure.kind + ": " + failure.message)
+                    }
                 }
             }
             r := lamCompileRouteWithOpts(method, full, handler, opts)
@@ -3124,7 +3620,13 @@ class Server {
     func _routeOptions(self, method: str, path: str, handler: func(Request, Response) | (func(Request, Response) -> html) | (func(Request, Response) -> xml) | (func(Request, Response) -> json) | (func(Request, Response) -> str), opts: RouteOptions) {
         go! {
             full := s.RoutePrefix + path
+            if opts != nil && opts.SchemaValue != nil {
+                if _, err := lamNormalizeSchemaSlots(opts.SchemaValue, opts.SchemaFormat); err != nil {
+                    panic(err.Error())
+                }
+            }
             optsTyped := lamCoerceRouteOpts(opts)
+            lamCheckRouteSchemaRefs(optsTyped, s.SharedSchemas)
             r := lamCompileRouteWithOpts(method, full, handler, optsTyped)
             s.Routes = append(s.Routes, r)
             t, ok := s.RouteTrie.(*lamRouteTrie)
@@ -3436,14 +3938,13 @@ class Server {
     # ─── Shared JSON Schemas ───────────────────────────────
     func addSchema(self, schema: any) {
         #- Register a shared JSON Schema so route schemas can
-        reference it by ``$ref``. ``schema`` may be a dict with
-        a top-level ``$id`` key, a ``(id, schema)`` 2-tuple, or
-        a raw JSON string whose first object carries the
-        ``$id``. Matching Fastify's ``fastify.addSchema(...)``:
+        reference it by ``$ref``. ``schema`` is a JSON object with a
+        top-level ``$id``: a native ``json`` value, a ``dict`` or JSON
+        text. Matching Fastify's ``fastify.addSchema(...)``:
 
         ::
 
-        srv.addSchema( {
+        srv.addSchema({
             "$id": "timestamp",
             "type": "string",
             "format": "date-time",
@@ -3454,38 +3955,51 @@ class Server {
                 "type": "object",
                 "properties": {
                     "createdAt": {"$ref": "timestamp"},
+                    "updatedAt": {"$ref": "timestamp"},
                 },
             }})
         srv.post("/events", createEvent, eventOptions)
 
+        A shared schema may be referenced any number of times and may
+        reference other shared schemas; references are inlined, so a
+        ``$ref`` cycle (a schema reaching itself, directly or through
+        others) is refused here with ``SchemaRefCycleError`` and the
+        previous registration of the id is kept. Routes may reference ids
+        registered after them.
+
         Re-registering the same ``$id`` replaces the previous schema;
-        this is how tests typically reset between cases. An empty or
-        missing ``$id`` is a no-op so handlers can pass through data
-        defensively. -#
+        this is how tests typically reset between cases. An object with
+        an empty or missing ``$id`` (and ``None``) is a no-op so handlers
+        can pass through data defensively. Anything that is not a JSON
+        object — a ``json`` array, string, number or null, JSON text of
+        one, another type — raises ``SchemaTypeError``; malformed JSON
+        text raises ``SchemaParseError``. -#
         go! {
-            text := ""
-            id := ""
-            switch v := schema.(type) {
-            case string:
-                text = v
-                var probe map[string]interface{}
-                if err := json.Unmarshal([]byte(v), &probe); err == nil {
-                    if raw, ok := probe["$id"].(string); ok {
-                        id = raw
-                    }
-                }
-            case map[string]interface{}:
-                if raw, ok := v["$id"].(string); ok {
-                    id = raw
-                }
-                if b, err := json.Marshal(v); err == nil {
-                    text = string(b)
-                }
-            }
-            if id == "" || text == "" {
+            if schema == nil {
                 return
             }
-            s.SharedSchemas[id] = text
+            obj, err := lamSchemaObject(schema, "addSchema")
+            if err != nil {
+                panic(err.Error())
+            }
+            id, _ := obj["$id"].(string)
+            if id == "" {
+                return
+            }
+            b, err := json.Marshal(obj)
+            if err != nil {
+                panic("SchemaTypeError: addSchema: " + err.Error())
+            }
+            previous, had := s.SharedSchemas[id]
+            s.SharedSchemas[id] = string(b)
+            if cycle := lamSharedSchemaCycle(s.SharedSchemas, id); cycle != nil {
+                if had {
+                    s.SharedSchemas[id] = previous
+                } else {
+                    delete(s.SharedSchemas, id)
+                }
+                panic(cycle.Error())
+            }
         }
     }
 
@@ -3523,6 +4037,55 @@ class Server {
         #- Restore the built-in schema-validation error envelope. A ``None``
         overload is not representable by Lam 1.18's function-type lowering. -#
         self.schemaErrorFormatter = None
+    }
+
+    func setSchemaIssueHandler(self, handler: func(str, list[SchemaIssue], Request, Response)) {
+        #- Install the handler of schema-validation failures. Signature:
+
+        ``func(where: str, issues: list[SchemaIssue], req: Request, res: Response)``
+
+        ``where`` is ``"body"``, ``"querystring"``, ``"params"`` or
+        ``"headers"``; ``issues`` (sorted by field, then keyword) carry the
+        field path, the JSON Schema keyword, the message and the offending
+        value (see ``SchemaIssue``). The handler writes the response
+        itself — status (preset to 400), headers, Content-Type, body:
+
+        ``res.code(422).type_("application/problem+json").send(text)``
+
+        The handler wins over ``setSchemaErrorFormatter``. If it sends
+        nothing, or raises, the formatter (when installed) or the built-in
+        envelope answers instead. -#
+        self.schemaIssueHandler = handler
+    }
+
+    func clearSchemaIssueHandler(self) {
+        #- Remove the schema issue handler. -#
+        self.schemaIssueHandler = None
+    }
+
+    func setPayloadTooLargeHandler(self, handler: func(Request, Response)) {
+        #- Shape the ``413 Payload Too Large`` responses. A body above the
+        effective limit (the route's ``bodyLimit``, else ``Server.bodyLimit``)
+        is refused before any hook runs, over HTTP and through ``inject``
+        alike; the handler then gets the request (``method``, ``path``,
+        ``headers``, ``query``, ``params``, ``routeOptions()``; no body) and
+        a response preset to 413, and writes it:
+
+        ``res.code(413).type_("application/problem+json").send(text)``
+
+        On ``streamBody`` routes the limit is hit while the handler reads:
+        the handler is called when that failure escapes it (the
+        ``RuntimeError`` of ``reader.readAll().unwrap()``, or the 413
+        ``HttpError`` of the ``Result`` raised again). A route's
+        ``RouteOptions.onPayloadTooLarge`` wins. If the handler sends
+        nothing (headers it set are kept) or raises, the default
+        ``413 payload too large`` text answers. -#
+        self.payloadTooLargeHandler = handler
+    }
+
+    func clearPayloadTooLargeHandler(self) {
+        #- Restore the default 413 response. -#
+        self.payloadTooLargeHandler = None
     }
 
     func onRequestAbort(self, hook: func(Request)) {
@@ -4492,15 +5055,42 @@ class Server {
             }
             req.RemoteAddr = "inject"
 
-            // Body-limit check. http path uses MaxBytesReader; we just
-            // measure the synthetic body length here.
+            // Body-limit check, as over HTTP: the effective limit is the
+            // route's ``bodyLimit``, else the server's; an oversized
+            // body is refused before any hook (the HTTP transport's
+            // MaxBytesReader does the same), and on a streamed route
+            // the reader fails once it crosses the limit.
             res := NewResponse()
-            if s.BodyLimit > 0 && len(body) > int(s.BodyLimit) {
-                res.Status = 413
-                res.Headers["Content-Type"] = "text/plain; charset=utf-8"
-                res.Body = "413 payload too large"
-                res.Sent = true
-            } else {
+            route, routeParams := lamMatchRouteWithParams(s, req.Method, req.Path)
+            limit := lamEffectiveBodyLimit(s, route)
+            refused := false
+            if limit > 0 && len(body) > limit {
+                if route != nil && route.opts != nil && route.opts.StreamBody {
+                    req.Body = ""
+                    req.StreamBody = true
+                    req.Ctx.Set("__lamBodyReader", &lamBodyLimitReader{
+                        ReadCloser: io.NopCloser(&lamInjectLimitReader{
+                            r:         strings.NewReader(body),
+                            remaining: int64(limit),
+                            limit:     int64(limit),
+                        }),
+                        req: req,
+                    })
+                } else {
+                    refused = true
+                    lamPrepareRequest(s, req, res)
+                    lamBindMatchedRoute(req, res, route, routeParams)
+                    func() {
+                        defer func() {
+                            if rec := recover(); rec != nil {
+                                lamHandlePanic(s, req, res, rec)
+                            }
+                        }()
+                        lamRespondPayloadTooLarge(s, req, res, route)
+                    }()
+                }
+            }
+            if !refused {
                 // Top-level shield around the dispatcher — see
                 // “lamServerHandle“ for the rationale. Without
                 // it, a buggy plugin would crash the test process
@@ -4572,10 +5162,45 @@ go! {
 
     // ─── Validation + serialization helpers ─────────────────
     func lamFailValidation(srv *Server, req *Request, res *Response,
-        where string, errs []string) {
+        where string, failure *lamSchemaFailure) {
+        errs := lamSchemaFailureMessages(failure)
         res.Status = 400
         if res.Headers == nil {
             res.Headers = map[string]string{}
+        }
+
+        // Issue handler: writes the whole response. One that sends
+        // nothing falls through (keeping the headers it set); one that
+        // panics is undone and falls through too.
+        if srv != nil && srv.SchemaIssueHandler != nil {
+            if fn, ok := srv.SchemaIssueHandler.(func(string, []*SchemaIssue, *Request, *Response)); ok {
+                issues := lamBuildSchemaIssues(failure)
+                saved := make(map[string]string, len(res.Headers))
+                for k, v := range res.Headers {
+                    saved[k] = v
+                }
+                panicked := false
+                func() {
+                    defer func() {
+                        if r := recover(); r != nil {
+                            panicked = true
+                            if srv.Debug {
+                                fmt.Fprintf(os.Stderr, "Vulture: schema issue handler panic: %v\n", r)
+                            }
+                        }
+                    }()
+                    fn(where, issues, req, res)
+                }()
+                if !panicked && res.Sent {
+                    return
+                }
+                if panicked {
+                    res.Headers = saved
+                    res.Body = ""
+                }
+                res.Sent = false
+                res.Status = 400
+            }
         }
 
         // Custom formatter — matches Fastify's
@@ -4720,8 +5345,12 @@ go! {
             return
         }
 
+        // Shared schemas are inlined first, so projection also follows
+        // a ``$ref`` (a shared object schema with
+        // ``additionalProperties: false`` drops its extra keys too).
+        schemaText := lamResolveSchemaRefs(text, srv.SharedSchemas)
         var schemaDoc map[string]interface{}
-        _ = json.Unmarshal([]byte(text), &schemaDoc)
+        _ = json.Unmarshal([]byte(schemaText), &schemaDoc)
         var body interface{}
         if err := json.Unmarshal([]byte(res.Body), &body); err != nil {
             return
@@ -4732,7 +5361,6 @@ go! {
         // allowed" errors after projection drops them).
         projected := lamProjectToSchema(body, schemaDoc)
 
-        schemaText := lamResolveSchemaRefs(text, srv.SharedSchemas)
         if failure := lamSchemaValidateValue(schemaText, lamJSONMust(projected)); failure != nil {
             if srv.Debug {
                 fmt.Fprintf(os.Stderr, "Vulture: response schema mismatch: %v\n", lamSchemaFailureMessages(failure))
@@ -4760,6 +5388,17 @@ go! {
     // (“lamServerHandle“) and the in-process test harness
     // (“Server.inject“) call this.
     func lamServerDispatch(srv *Server, req *Request, res *Response) {
+        lamPrepareRequest(srv, req, res)
+        // ── Static-file mounts: served before route matching so
+        //
+        //  static URLs never touch the routes table.
+        lamServeStatic(srv, req, res)
+        lamDispatchRoutes(srv, req, res)
+    }
+
+    // lamPrepareRequest threads the server-wide request state (trust
+    // proxy, start time, path, decorators) onto req / res.
+    func lamPrepareRequest(srv *Server, req *Request, res *Response) {
         // ── Trust-proxy thread: stash the configured header names on
         //
         //  req.Ctx so Request.realIP / Request.realScheme see them.
@@ -4805,10 +5444,10 @@ go! {
         if len(srv.ReplyDecorators) > 0 {
             res.Ctx["__lamRespDecorators"] = srv.ReplyDecorators
         }
+    }
 
-        // ── Static-file mounts: served before route matching so
-        //
-        //  static URLs never touch the routes table.
+    // lamServeStatic answers from the static mounts, if one matches.
+    func lamServeStatic(srv *Server, req *Request, res *Response) {
         for _, m := range srv.StaticMounts {
             mount, ok := m.([2]string)
             if !ok {
@@ -4847,7 +5486,10 @@ go! {
             res.Sent = true
             break
         }
+    }
 
+    // lamDispatchRoutes matches the route and runs the hook ladder.
+    func lamDispatchRoutes(srv *Server, req *Request, res *Response) {
         // ── Route matching. Trie-backed for speed when populated
         //
         //  (route() overloads index into it on registration).
@@ -4960,13 +5602,13 @@ go! {
             runEarlyHooks(srv.OnRequestHooks)
         }
 
-        // ── 2. body limit (per-route)
+        // ── 2. body limit (per-route). Both transports refuse an
+        //
+        //  oversized body before dispatching; this catches a body an
+        //  onRequest hook replaced.
         if !res.Sent && matched != nil && matched.opts != nil && matched.opts.BodyLimit > 0 {
             if len(req.Body) > matched.opts.BodyLimit {
-                res.Status = 413
-                res.Headers["Content-Type"] = "text/plain; charset=utf-8"
-                res.Body = "413 payload too large"
-                res.Sent = true
+                lamRespondPayloadTooLarge(srv, req, res, matched)
             }
         }
 
@@ -5040,32 +5682,33 @@ go! {
                     failure = &lamSchemaFailure{kind: "SchemaFormatError", message: "unsupported schema format: " + format}
                 }
                 if failure != nil && failure.kind == "SchemaCompileError" &&
-                    format == "json" && lamMissingSharedSchemaRef(opts.BodySchema, srv.SharedSchemas) {
+                    format == "json" && lamMissingSharedSchemaRef(schemaText, srv.SharedSchemas) {
                     failure = nil
                 }
                 if failure != nil {
-                    lamFailValidation(srv, req, res, "body", lamSchemaFailureMessages(failure))
+                    lamFailValidation(srv, req, res, "body", failure)
                 }
             }
             if !res.Sent && opts.QuerySchema != "" {
                 schemaText := lamResolveSchemaRefs(opts.QuerySchema, srv.SharedSchemas)
-                failure := lamSchemaValidateValue(schemaText, lamJSONMust(lamQueryForSchema(req.Query)))
+                document := lamQueryForSchemaText(req.Query, req.QueryMulti, schemaText)
+                failure := lamSchemaValidateValue(schemaText, lamJSONMust(document))
                 if failure != nil {
-                    lamFailValidation(srv, req, res, "querystring", lamSchemaFailureMessages(failure))
+                    lamFailValidation(srv, req, res, "querystring", failure)
                 }
             }
             if !res.Sent && opts.ParamsSchema != "" {
                 schemaText := lamResolveSchemaRefs(opts.ParamsSchema, srv.SharedSchemas)
                 failure := lamSchemaValidateValue(schemaText, lamJSONMust(lamParamsForSchema(req.Params)))
                 if failure != nil {
-                    lamFailValidation(srv, req, res, "params", lamSchemaFailureMessages(failure))
+                    lamFailValidation(srv, req, res, "params", failure)
                 }
             }
             if !res.Sent && opts.HeadersSchema != "" {
                 schemaText := lamResolveSchemaRefs(opts.HeadersSchema, srv.SharedSchemas)
                 failure := lamSchemaValidateValue(schemaText, lamJSONMust(lamHeadersAsLowerMap(req.Headers)))
                 if failure != nil {
-                    lamFailValidation(srv, req, res, "headers", lamSchemaFailureMessages(failure))
+                    lamFailValidation(srv, req, res, "headers", failure)
                 }
             }
         }
@@ -5195,6 +5838,162 @@ go! {
             }
         }
         return nil
+    }
+
+    // lamMatchRouteWithParams is “lamPickRouteForRequest“ plus the
+    // path parameters of the match.
+    func lamMatchRouteWithParams(srv *Server, method, path string) (*lamRoute, map[string]string) {
+        if srv == nil {
+            return nil, nil
+        }
+        segs := lamSplitPath(path)
+        if t, ok := srv.RouteTrie.(*lamRouteTrie); ok && t != nil {
+            r, params, _ := lamTrieMatch(t, method, segs)
+            if r != nil {
+                return r, params
+            }
+        }
+        for _, rr := range srv.Routes {
+            route, ok := rr.(lamRoute)
+            if !ok {
+                continue
+            }
+            if params, ok := lamMatchRoute(route, method, segs); ok {
+                rcopy := route
+                return &rcopy, params
+            }
+        }
+        return nil, nil
+    }
+
+    // lamEffectiveBodyLimit: the route's “bodyLimit“, else the
+    // server's (“0“ = none).
+    func lamEffectiveBodyLimit(srv *Server, route *lamRoute) int {
+        if route != nil && route.opts != nil && route.opts.BodyLimit > 0 {
+            return route.opts.BodyLimit
+        }
+        return srv.BodyLimit
+    }
+
+    // lamBindMatchedRoute exposes the matched route on a request that
+    // will not reach the dispatcher (a 413 refused up front): params,
+    // “routeOptions()“ / “routePath()“.
+    func lamBindMatchedRoute(req *Request, res *Response, route *lamRoute, params map[string]string) {
+        for k, v := range params {
+            req.Params[k] = v
+        }
+        if route != nil {
+            req.Ctx.Set("__lamMatchedRoute", route)
+            res.Ctx["__lamMatchedRoute"] = route
+        }
+    }
+
+    func lamDefaultPayloadTooLarge(res *Response) {
+        res.Status = 413
+        if res.Headers == nil {
+            res.Headers = map[string]string{}
+        }
+        res.Headers["Content-Type"] = "text/plain; charset=utf-8"
+        res.Body = "413 payload too large"
+        res.Sent = true
+    }
+
+    // lamPayloadTooLargeHandler: the route's handler, else the server's.
+    func lamPayloadTooLargeHandler(srv *Server, route *lamRoute) func(*Request, *Response) {
+        if route != nil && route.opts != nil && route.opts.PayloadTooLarge != nil {
+            if fn, ok := route.opts.PayloadTooLarge.(func(*Request, *Response)); ok {
+                return fn
+            }
+        }
+        if fn, ok := srv.PayloadTooLargeHandler.(func(*Request, *Response)); ok {
+            return fn
+        }
+        return nil
+    }
+
+    // lamRespondPayloadTooLarge writes the 413 of a body above the
+    // limit: through the configured handler (response preset to 413),
+    // else the default text. A handler that sends nothing gets the
+    // default body (its headers kept); one that panics is undone.
+    func lamRespondPayloadTooLarge(srv *Server, req *Request, res *Response, route *lamRoute) {
+        fn := lamPayloadTooLargeHandler(srv, route)
+        if fn == nil {
+            lamDefaultPayloadTooLarge(res)
+            return
+        }
+        if res.Headers == nil {
+            res.Headers = map[string]string{}
+        }
+        saved := make(map[string]string, len(res.Headers))
+        for k, v := range res.Headers {
+            saved[k] = v
+        }
+        res.Status = 413
+        res.Body = ""
+        res.Sent = false
+        panicked := false
+        func() {
+            defer func() {
+                if r := recover(); r != nil {
+                    panicked = true
+                    if srv.Debug {
+                        fmt.Fprintf(os.Stderr, "Vulture: payload-too-large handler panic: %v\n", r)
+                    }
+                }
+            }()
+            fn(req, res)
+        }()
+        if panicked {
+            res.Headers = saved
+            lamDefaultPayloadTooLarge(res)
+            return
+        }
+        if !res.Sent {
+            lamDefaultPayloadTooLarge(res)
+        }
+    }
+
+    // lamBodyLimitReader flags the request when the transport's
+    // body limit trips while a streamed route reads its body, so the
+    // 413 that escapes the handler goes through the 413 handler.
+    type lamBodyLimitReader struct {
+        io.ReadCloser
+        req *Request
+    }
+
+    func (b *lamBodyLimitReader) Read(p []byte) (int, error) {
+        n, err := b.ReadCloser.Read(p)
+        if err != nil && err != io.EOF {
+            var mbe *http.MaxBytesError
+            if errors.As(err, &mbe) {
+                b.req.Ctx.Set("__lamBodyLimitHit", true)
+            }
+        }
+        return n, err
+    }
+
+    // lamInjectLimitReader emulates “http.MaxBytesReader“ for
+    // “inject“ on streamed routes: up to “limit“ bytes, then
+    // “*http.MaxBytesError“.
+    type lamInjectLimitReader struct {
+        r         *strings.Reader
+        remaining int64
+        limit     int64
+    }
+
+    func (l *lamInjectLimitReader) Read(p []byte) (int, error) {
+        if l.remaining <= 0 {
+            if l.r.Len() > 0 {
+                return 0, &http.MaxBytesError{Limit: l.limit}
+            }
+            return 0, io.EOF
+        }
+        if int64(len(p)) > l.remaining {
+            p = p[:l.remaining]
+        }
+        n, err := l.r.Read(p)
+        l.remaining -= int64(n)
+        return n, err
     }
 
     // lamWriteTimeoutResponse fills “res“ with a Fastify-style 408
@@ -5337,14 +6136,11 @@ go! {
         //  again below — the routing cost is negligible (one
         //  trie walk) and the alternative would be splitting the
         //  dispatcher in half, which is worse.
-        var peekedRoute *lamRoute = lamPickRouteForRequest(srv, req.Method, req.Path)
+        peekedRoute, peekedParams := lamMatchRouteWithParams(srv, req.Method, req.Path)
 
         // Effective per-request body limit. Route override beats
         // server default, matching the existing dispatcher rule.
-        effBodyLimit := srv.BodyLimit
-        if peekedRoute != nil && peekedRoute.opts != nil && peekedRoute.opts.BodyLimit > 0 {
-            effBodyLimit = peekedRoute.opts.BodyLimit
-        }
+        effBodyLimit := lamEffectiveBodyLimit(srv, peekedRoute)
 
         // Body read with optional size cap (413 if exceeded).
         //
@@ -5365,7 +6161,11 @@ go! {
             // “net/http“ closes any un-drained body when the
             // handler returns, so unused streams don't leak FDs.
             req.StreamBody = true
-            req.Ctx.Set("__lamBodyReader", r.Body)
+            if effBodyLimit > 0 {
+                req.Ctx.Set("__lamBodyReader", &lamBodyLimitReader{ReadCloser: r.Body, req: req})
+            } else {
+                req.Ctx.Set("__lamBodyReader", r.Body)
+            }
         } else {
             body, readErr = io.ReadAll(r.Body)
             r.Body.Close()
@@ -5418,10 +6218,11 @@ go! {
         if readErr != nil {
             var maxErr *http.MaxBytesError
             if errors.As(readErr, &maxErr) {
-                res.Status = 413
-                res.Headers["Content-Type"] = "text/plain; charset=utf-8"
-                res.Body = "413 payload too large"
-                res.Sent = true
+                // Refused before any hook, like inject: only the
+                // payload-too-large handler sees the request.
+                lamPrepareRequest(srv, req, res)
+                lamBindMatchedRoute(req, res, peekedRoute, peekedParams)
+                lamRespondPayloadTooLarge(srv, req, res, peekedRoute)
             } else {
                 res.Status = 400
                 res.Headers["Content-Type"] = "text/plain; charset=utf-8"
@@ -5667,7 +6468,21 @@ go! {
         if res.Sent {
             return
         }
-        if he, ok := lamExtractHttpError(rec); ok {
+        he, isHttpError := lamExtractHttpError(rec)
+        // A streamed route's body crossed the limit and the failure
+        // escaped the handler (the 413 ``HttpError`` itself, or the
+        // ``RuntimeError`` of ``unwrap()`` on it): with a
+        // payload-too-large handler configured, it shapes the response
+        // like the 413s refused up front. Another HttpError the handler
+        // raised on purpose keeps its status.
+        if hit, _ := req.Ctx.Get("__lamBodyLimitHit", false).(bool); hit && (!isHttpError || he.Status == 413) {
+            route, _ := req.Ctx.Get("__lamMatchedRoute", nil).(*lamRoute)
+            if lamPayloadTooLargeHandler(srv, route) != nil {
+                lamRespondPayloadTooLarge(srv, req, res, route)
+                return
+            }
+        }
+        if isHttpError {
             lamWriteHttpError(res, he)
             return
         }

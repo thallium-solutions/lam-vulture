@@ -26,7 +26,7 @@ lamc install https://github.com/thallium-solutions/lam-vulture.git
 Install the registry release:
 
 ```bash
-lamc install @lam/vulture@3.2.0
+lamc install @lam/vulture@3.3.0
 ```
 
 Install a local checkout during development:
@@ -218,9 +218,9 @@ func main() {
 }
 ```
 
-`RouteOptions.withSchema` accepts heterogeneous JSON Schema trees, and
-`metadata` accepts opaque application values; these are documented dynamic
-boundaries. Handlers, hooks, plugins, SSE emitters, content-type parsers, and
+`RouteOptions.withSchema` accepts JSON Schema trees (native `json`, `dict` or
+JSON text; see [Validation](#validation)), and `metadata` accepts opaque
+application values; these are documented dynamic boundaries. Handlers, hooks, plugins, SSE emitters, content-type parsers, and
 schema-error formatters use Lam 1.18 function types.
 
 ## API overview
@@ -243,7 +243,8 @@ The complete public implementation is exported from `__init__.lam`.
   and connection hijacking.
 - `HttpError` — typed HTTP failures with common status constructors.
 - `RequestBodyReader` — Result-based incremental and file-backed request-body consumption.
-- `RouteOptions` — typed per-route limits, timeout, streaming, hooks, schemas, and metadata.
+- `RouteOptions` — typed per-route limits, timeout, streaming, hooks, schemas, a 413 handler, and metadata.
+- `SchemaIssue` — one schema-validation failure: field path, keyword, message, value.
 - `InjectResponse` — typed `status`, `body`, and `headers` from in-process dispatch.
 - `SseEmitter` — Server-Sent Event data, named events, comments, and close.
 
@@ -278,9 +279,178 @@ func filter(req: Request, res: Response) -> json {
 }
 ```
 
-Route schemas can validate body, query, path parameters, and headers and can
-project response payloads. `listRoutes`, `printRoutes`, `routeOptions`, and
-`openapi` expose registered route metadata.
+`listRoutes`, `printRoutes`, `routeOptions`, and `openapi` expose registered
+route metadata.
+
+## Validation
+
+Route schemas (JSON Schema draft-07, validated by gojsonschema) check the
+body, the query string, the path parameters and the headers before the
+`preHandler` hooks, and project response payloads. Attach them with
+`RouteOptions.withSchema` or, for a body schema alone, with the
+`post(path, handler, schema, "json")` overloads (`"yaml"` and `"xml"`/XSD
+bodies too):
+
+```lammergeier
+from @lam/vulture import Request, Response, RouteOptions, Server
+
+func createOrder(req: Request, res: Response) -> json {
+    return {"created": true}
+}
+
+func main() {
+    app: Server = Server()
+    app.addSchema({"$id": "uuid", "type": "string", "format": "uuid"})
+    app.addSchema({"$id": "money", "type": "number", "minimum": 0})
+    schema: json = {
+        "body": {
+            "type": "object",
+            "required": ["customer", "total"],
+            "additionalProperties": false,
+            "properties": {
+                "customer": {"$ref": "uuid"},
+                "shop": {"$ref": "uuid"},
+                "total": {"$ref": "money"},
+            },
+        },
+        "querystring": {"type": "object", "properties": {"tag": {"type": "array", "items": {"type": "string"}}}},
+        "params": {"type": "object", "properties": {"id": {"$ref": "uuid"}}},
+        "response": {"200": {"type": "object", "additionalProperties": false, "properties": {"created": {"type": "boolean"}}}},
+    }
+    app.post("/shops/:id/orders", createOrder, RouteOptions().withSchema(schema))
+    _ = app.listen(8080).unwrap()
+}
+```
+
+The slots are `body`, `querystring` (or `query`), `params`, `headers` and
+`response` (keyed by status: `"200"`, `"2xx"`, `"default"`). The slot map and
+every schema may be a native `json` object, a `dict` or JSON text;
+`withSchema` refuses anything else at once — a `json` array or scalar, a
+number, malformed JSON — with `SchemaTypeError` / `SchemaParseError` (YAML and
+XSD body schemas are text, with `withSchema(schema, "yaml")`).
+
+What each slot validates:
+
+- `body`: the parsed JSON body (`null` when empty).
+- `querystring`: an object of the query parameters, as strings (no
+  coercion: `{"type": "integer"}` refuses `?page=2`; use a `pattern`). A
+  repeated parameter is its first value (`req.query`), except for a property
+  whose schema type is `"array"` (or a type list containing it): that one
+  is every value, in order (`req.queryAll`), so `?tag=a&tag=b` validates
+  `["a", "b"]` against `items` / `minItems` / `uniqueItems`.
+- `params`: an object of the path parameters **named without the `:`**:
+  the route `/shops/:id` validates `{"id": "..."}` while handlers read
+  `req.params[":id"]`.
+- `headers`: an object of the request headers with lower-case names
+  (`"x-api-key"`), first value of each.
+
+### Shared schemas
+
+`srv.addSchema(schema)` registers a schema under its `$id` (a `json` object,
+a `dict` or JSON text); route schemas and other shared schemas use it with
+`{"$ref": "<id>"}`, as many times as needed (two `uuid` properties, array
+`items`, a shared `address` that references a shared `zip`). References are
+inlined, so a `$ref` cycle — a schema that reaches itself, directly or
+through others — is refused when it is created: `addSchema` raises
+`SchemaRefCycleError: shared schema $ref cycle: a -> b -> a` and keeps the
+previous registration of the id; a route registration that would use a cycle
+(the `sharedSchemas` registry edited by hand) raises the same error; a cycle
+met by a request answers 500. Recursive (tree) schemas therefore cannot be
+shared. A route may reference an id registered after it; until then the
+reference is not checked. Re-registering an id replaces the schema;
+`removeSchema(id)` forgets it. `{"$ref": "#/definitions/x"}` fragments are
+resolved by gojsonschema against the route schema.
+
+### Validation errors
+
+A failed validation answers 400. By default the body is
+`{"statusCode": 400, "error": "Bad Request", "message": "validation failed: body", "validation": [messages]}`
+(`application/json; charset=utf-8`). Two hooks change it:
+
+- `srv.setSchemaIssueHandler(handler)` — `func(where: str, issues:
+  list[SchemaIssue], req: Request, res: Response)` writes the whole
+  response: status (preset to 400), headers, Content-Type, body. `where`
+  is `"body"`, `"querystring"`, `"params"` or `"headers"`. A handler that
+  sends nothing, or raises, falls back to the formatter or the default.
+  `clearSchemaIssueHandler()` removes it.
+- `srv.setSchemaErrorFormatter(formatter)` — `func(where: str, errs:
+  list[str], req: Request) -> any` returns the body only: a dict is sent
+  as `application/json; charset=utf-8`, a `str` as `text/plain`. The issue
+  handler wins when both are installed.
+
+Each `SchemaIssue` has:
+
+| Field | Meaning |
+| --- | --- |
+| `field: str` | dotted path in the validated document: `"price"`, `"items.0.size"`, `""` for the document itself; `required` names the missing property, `additionalProperties` the extra one |
+| `keyword: str` | the JSON Schema keyword: `required`, `type`, `enum`, `const`, `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `minLength`, `maxLength`, `pattern`, `format`, `minItems`, `maxItems`, `uniqueItems`, `additionalProperties`, `propertyNames`, `dependencies`, `anyOf`, `oneOf`, `allOf`, `not`, …; `parse` for a malformed document, `schema` for a schema that does not compile, `xsd` for XSD failures |
+| `message: str` | the validator's description (what the formatter receives) |
+| `value: json`, `hasValue: bool` | the offending value, when there is one (`required` has none) |
+
+Issues are sorted by field (array indexes numerically), then keyword.
+`json(issue)` gives `{"field", "keyword", "message", "value"}` (`value` only
+when `hasValue`).
+
+```lammergeier
+from lamjson import Json
+from @lam/vulture import Request, Response, SchemaIssue, Server
+
+func validationProblem(where: str, issues: list[SchemaIssue], req: Request, res: Response) {
+    errors: list[json] = [json(issue) for issue in issues]
+    doc: json = {
+        "type": "https://example.com/problems/validation",
+        "title": "The request is not valid",
+        "status": 422,
+        "instance": req.path,
+        "in": where,
+        "errors": errors,
+    }
+    _ = res.code(422).type_("application/problem+json").send(Json.encode(doc).unwrap())
+}
+
+func main() {
+    app: Server = Server()
+    app.setSchemaIssueHandler(validationProblem)
+    # ... routes with schemas ...
+    _ = app.listen(8080).unwrap()
+}
+```
+
+`{"items": [{}], "extra": 1}` against a schema requiring `items[].size` and
+refusing extra properties gives the issues `extra` / `additionalProperties`
+(value `1`) and `items.0.size` / `required`.
+
+### Body limits and 413
+
+`srv.bodyLimit` (bytes) and `RouteOptions(bodyLimit)` cap request bodies; the
+route's limit, when set, replaces the server's. A body above the limit is
+refused with 413 **before any hook runs**, over HTTP (the transport stops
+reading) and through `inject` alike. The default response is
+`413 payload too large` (`text/plain; charset=utf-8`).
+
+`srv.setPayloadTooLargeHandler(handler)` — `func(req: Request, res:
+Response)` — shapes every 413; `RouteOptions.onPayloadTooLarge(handler)`
+does it for one route and wins. The handler sees `req.method`, `req.path`,
+`req.headers`, `req.query`, `req.params` and `req.routeOptions()` (not the
+body) and writes the response, preset to 413. If it sends nothing (headers it
+set are kept) or raises, the default text answers.
+`clearPayloadTooLargeHandler()` restores the default.
+
+```lammergeier
+func tooLarge(req: Request, res: Response) {
+    doc: json = {"type": "about:blank", "title": "Payload Too Large", "status": 413, "instance": req.path}
+    _ = res.code(413).type_("application/problem+json").send(Json.encode(doc).unwrap())
+}
+
+app.setPayloadTooLargeHandler(tooLarge)
+app.post("/uploads", upload, RouteOptions(10485760, 0, true))
+```
+
+On `streamBody` routes nothing is buffered: the limit trips while the
+handler reads (`reader.readAll()` returns the 413 `HttpError`). When that
+failure escapes the handler — `unwrap()` raising, or the `HttpError` raised
+again — the 413 handler answers; without one, the `HttpError` is rendered
+as JSON as before.
 
 ## Security notes
 
@@ -306,7 +476,7 @@ project response payloads. `listRoutes`, `printRoutes`, `routeOptions`, and
 python3 tests/run_tests.py --verbose
 ```
 
-The runner requires `lamc >= 1.18.0`, stages this checkout as
+The runner requires `lamc >= 4.0.0`, stages this checkout as
 `extlibs/@lam/vulture` in an isolated temporary directory, compiles without the
 compiler cache, runs every migrated central end-to-end server test, and compares
 stdout against the original exact `# expect:` output. Tests for the standard

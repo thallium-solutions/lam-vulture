@@ -1,0 +1,271 @@
+# Test: shared schemas (srv.addSchema) referenced more than once, nested
+# references, and $ref cycles.
+#
+# A shared id referenced twice in one route schema used to stay
+# unresolved the second time ("Reference uuid must be canonical"): every
+# request got 400. Cycles are rejected when they are created (addSchema)
+# or seen by a route registration, never per request with a 400.
+#
+# expect: twice-valid: 200 ok
+# expect: twice-second-invalid: 400
+# expect: twice-first-invalid: 400
+# expect: items-and-property: 200 400
+# expect: nested-valid: 200
+# expect: nested-invalid: 400
+# expect: diamond: 200 400
+# expect: querystring-twice: 200 400
+# expect: params: 200 400
+# expect: headers-twice: 200 400
+# expect: response-twice: {"a":"x","b":"y"}
+# expect: response-nested-projection: {"coOwner":{"name":"Bo"},"owner":{"name":"Ada"}}
+# expect: overload-twice: 200 400
+# expect: cycle-pair: rejected=true message=true registered=false
+# expect: cycle-self: rejected=true registered=false
+# expect: cycle-replace: rejected=true kept-old=200
+# expect: cycle-route-time: rejected=true
+# expect: cycle-request-time: 500
+# expect: missing-then-added: 200 400
+# expect: http-twice: 200 400
+
+from lamjson import Json
+from @lam/vulture import InjectResponse, Request, Response, RouteOptions, Server
+
+const Uuid1: str = "11111111-2222-3333-4444-555555555555"
+const Uuid2: str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+func ok(_req: Request, _res: Response) -> str {
+    return "ok"
+}
+
+func pair(_req: Request, _res: Response) -> json {
+    return {"a": "x", "b": "y", "c": "dropped"}
+}
+
+func owner(_req: Request, _res: Response) -> json {
+    return {"owner": {"name": "Ada", "passwordHash": "secret"}, "coOwner": {"name": "Bo", "passwordHash": "secret"}}
+}
+
+func options(schema: dict[str, any]) -> RouteOptions {
+    return RouteOptions().withSchema(schema)
+}
+
+func post(srv: Server, path: str, body: str) -> InjectResponse {
+    return srv.inject("POST", path, body, {"Content-Type": "application/json"})
+}
+
+func enc(doc: json) -> str {
+    return Json.encode(doc).unwrap()
+}
+
+func uuidSchema() -> dict[str, any] {
+    return {"$id": "uuid", "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}
+}
+
+func twoUuids() -> dict[str, any] {
+    return {
+        "type": "object",
+        "required": ["a", "b"],
+        "properties": {"a": {"$ref": "uuid"}, "b": {"$ref": "uuid"}},
+    }
+}
+
+func main() {
+    srv: Server = Server()
+    srv.addSchema(uuidSchema())
+    srv.addSchema({"$id": "zip", "type": "string", "pattern": "^[0-9]{5}$"})
+    srv.addSchema({
+        "$id": "address",
+        "type": "object",
+        "required": ["zip"],
+        "properties": {"zip": {"$ref": "zip"}, "city": {"type": "string"}},
+    })
+    srv.addSchema({
+        "$id": "uuidPair",
+        "type": "object",
+        "properties": {"left": {"$ref": "uuid"}, "right": {"$ref": "uuid"}},
+    })
+    srv.addSchema({"$id": "digits", "type": "string", "pattern": "^[0-9]+$"})
+
+    srv.post("/twice", ok, options({"body": twoUuids()}))
+    srv.post("/items", ok, options({"body": {
+        "type": "object",
+        "properties": {
+            "ids": {"type": "array", "items": {"$ref": "uuid"}},
+            "owner": {"$ref": "uuid"},
+        },
+    }}))
+    srv.post("/nested", ok, options({"body": {
+        "type": "object",
+        "properties": {"shipping": {"$ref": "address"}, "billing": {"$ref": "address"}},
+    }}))
+    srv.post("/diamond", ok, options({"body": {
+        "type": "object",
+        "properties": {"pair": {"$ref": "uuidPair"}, "id": {"$ref": "uuid"}},
+    }}))
+    srv.get("/search", ok, options({"querystring": {
+        "type": "object",
+        "properties": {"page": {"$ref": "digits"}, "size": {"$ref": "digits"}},
+    }}))
+    srv.get("/things/:id", ok, options({"params": {
+        "type": "object",
+        "properties": {"id": {"$ref": "uuid"}},
+    }}))
+    srv.get("/headers", ok, options({"headers": {
+        "type": "object",
+        "required": ["x-a", "x-b"],
+        "properties": {"x-a": {"$ref": "digits"}, "x-b": {"$ref": "digits"}},
+    }}))
+    srv.addSchema({"$id": "short", "type": "string", "maxLength": 3})
+    srv.get("/pair", pair, options({"response": {"200": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {"a": {"$ref": "short"}, "b": {"$ref": "short"}},
+    }}}))
+    srv.addSchema({"$id": "publicUser", "type": "object", "additionalProperties": false, "properties": {"name": {"type": "string"}}})
+    srv.get("/owner", owner, options({"response": {"200": {
+        "type": "object",
+        "properties": {"owner": {"$ref": "publicUser"}, "coOwner": {"$ref": "publicUser"}},
+    }}}))
+    overloadSchema: json = {
+        "type": "object",
+        "properties": {"a": {"$ref": "uuid"}, "b": {"$ref": "uuid"}},
+    }
+    srv.post("/overload", ok, overloadSchema, "json")
+
+    r: InjectResponse = post(srv, "/twice", enc({"a": Uuid1, "b": Uuid2}))
+    print(f"twice-valid: {r.status} {r.body}")
+    r = post(srv, "/twice", enc({"a": Uuid1, "b": "nope"}))
+    print(f"twice-second-invalid: {r.status}")
+    r = post(srv, "/twice", enc({"a": "nope", "b": Uuid2}))
+    print(f"twice-first-invalid: {r.status}")
+
+    good: InjectResponse = post(srv, "/items", enc({"ids": [Uuid1, Uuid2], "owner": Uuid1}))
+    bad: InjectResponse = post(srv, "/items", enc({"ids": [Uuid1, "x"], "owner": Uuid1}))
+    print(f"items-and-property: {good.status} {bad.status}")
+
+    r = post(srv, "/nested", '{"shipping":{"zip":"20100"},"billing":{"zip":"10100","city":"Torino"}}')
+    print(f"nested-valid: {r.status}")
+    r = post(srv, "/nested", '{"shipping":{"zip":"20100"},"billing":{"zip":"1O1OO"}}')
+    print(f"nested-invalid: {r.status}")
+
+    good = post(srv, "/diamond", enc({"pair": {"left": Uuid1, "right": Uuid2}, "id": Uuid1}))
+    bad = post(srv, "/diamond", enc({"pair": {"left": Uuid1, "right": "no"}, "id": Uuid1}))
+    print(f"diamond: {good.status} {bad.status}")
+
+    good = srv.inject("GET", "/search?page=2&size=20")
+    bad = srv.inject("GET", "/search?page=2&size=x")
+    print(f"querystring-twice: {good.status} {bad.status}")
+
+    good = srv.inject("GET", "/things/" + Uuid1)
+    bad = srv.inject("GET", "/things/nope")
+    print(f"params: {good.status} {bad.status}")
+
+    good = srv.inject("GET", "/headers", "", {"X-A": "1", "X-B": "2"})
+    bad = srv.inject("GET", "/headers", "", {"X-A": "1", "X-B": "two"})
+    print(f"headers-twice: {good.status} {bad.status}")
+
+    r = srv.inject("GET", "/pair")
+    print(f"response-twice: {r.body}")
+
+    r = srv.inject("GET", "/owner")
+    print(f"response-nested-projection: {r.body}")
+
+    good = post(srv, "/overload", enc({"a": Uuid1, "b": Uuid2}))
+    bad = post(srv, "/overload", enc({"a": Uuid1, "b": "x"}))
+    print(f"overload-twice: {good.status} {bad.status}")
+
+    # a -> b, then b -> a closes a cycle: b is refused.
+    cyc: Server = Server()
+    cyc.addSchema({"$id": "a", "type": "object", "properties": {"next": {"$ref": "b"}}})
+    rejected: bool = false
+    message: bool = false
+    try {
+        cyc.addSchema({"$id": "b", "type": "object", "properties": {"back": {"$ref": "a"}}})
+    } catch err {
+        rejected = true
+        text: str = str(err)
+        message = text.contains("SchemaRefCycleError") and text.contains("b -> a -> b")
+    }
+    print(f"cycle-pair: rejected={rejected} message={message} registered={'b' in cyc.sharedSchemas}")
+
+    rejected = false
+    try {
+        cyc.addSchema({"$id": "node", "type": "object", "properties": {"child": {"$ref": "node"}}})
+    } catch err {
+        rejected = str(err).contains("node -> node")
+    }
+    print(f"cycle-self: rejected={rejected} registered={'node' in cyc.sharedSchemas}")
+
+    # Replacing a schema with one that closes a cycle keeps the old one.
+    rep: Server = Server()
+    rep.addSchema({"$id": "outer", "type": "object", "properties": {"inner": {"$ref": "inner"}}})
+    rep.addSchema({"$id": "inner", "type": "string", "maxLength": 2})
+    rep.post("/outer", ok, options({"body": {"$ref": "outer"}}))
+    rejected = false
+    try {
+        rep.addSchema({"$id": "inner", "type": "object", "properties": {"up": {"$ref": "outer"}}})
+    } catch err {
+        rejected = str(err).contains("inner -> outer -> inner")
+    }
+    kept: InjectResponse = post(rep, "/outer", '{"inner":"ab"}')
+    print(f"cycle-replace: rejected={rejected} kept-old={kept.status}")
+
+    # A cycle put straight into the registry is refused by the route
+    # registration that would use it...
+    raw: Server = Server()
+    raw.sharedSchemas["loop"] = '{"$id":"loop","type":"object","properties":{"again":{"$ref":"loop"}}}'
+    rejected = false
+    try {
+        raw.post("/loop", ok, options({"body": {"$ref": "loop"}}))
+    } catch err {
+        rejected = str(err).contains("SchemaRefCycleError")
+    }
+    print(f"cycle-route-time: rejected={rejected}")
+
+    # ...and a request reaching one later is a server error, not a 400.
+    late: Server = Server()
+    late.addSchema({"$id": "spin", "type": "string"})
+    late.post("/spin", ok, options({"body": {"type": "object", "properties": {"s": {"$ref": "spin"}}}}))
+    late.sharedSchemas["spin"] = '{"$id":"spin","type":"object","properties":{"s":{"$ref":"spin"}}}'
+    r = post(late, "/spin", '{"s":{}}')
+    print(f"cycle-request-time: {r.status}")
+
+    # A route may reference a shared schema registered after it.
+    order: Server = Server()
+    order.post("/later", ok, options({"body": twoUuids()}))
+    order.addSchema(uuidSchema())
+    good = post(order, "/later", enc({"a": Uuid1, "b": Uuid2}))
+    bad = post(order, "/later", enc({"a": Uuid1, "b": "x"}))
+    print(f"missing-then-added: {good.status} {bad.status}")
+
+    # The same schema over a real listener.
+    _ = srv.listenBackground(0).unwrap()
+    address: str = srv.boundAddr
+    goodStatus: int = 0
+    badStatus: int = 0
+    body1: str = enc({"a": Uuid1, "b": Uuid2})
+    body2: str = enc({"a": Uuid1, "b": "zz"})
+    go! {
+        call := func(body string) int {
+            resp, err := http.Post("http://"+address+"/twice", "application/json", strings.NewReader(body))
+            if err != nil {
+                return 0
+            }
+            defer resp.Body.Close()
+            _, _ = io.ReadAll(resp.Body)
+            return resp.StatusCode
+        }
+        goodStatus = call(body1)
+        badStatus = call(body2)
+    }
+    srv.close()
+    print(f"http-twice: {goodStatus} {badStatus}")
+}
+
+go! {
+    import (
+        "io"
+        "net/http"
+        "strings"
+    )
+}

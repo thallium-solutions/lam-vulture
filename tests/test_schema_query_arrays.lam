@@ -1,0 +1,135 @@
+# Test: querystring schemas with repeated parameters, and params schemas.
+#
+# A querystring property whose schema type is "array" is validated against
+# every value of the parameter (req.queryAll); other properties see the
+# first value (req.query), as before. Query values are strings: no
+# coercion. Params schemas name the parameters without the ":" that
+# req.params keeps in its keys.
+#
+# expect: array-two-valid: 200 brand=nike|adidas first=nike
+# expect: array-one-valid: 200
+# expect: array-invalid-item: 400 querystring brand.1:enum:"puma"
+# expect: array-minItems: 400 querystring brand:minItems:["nike"]
+# expect: array-maxItems: 400 querystring brand:maxItems:["nike","adidas","nike","adidas"] brand:uniqueItems:["nike","adidas","nike","adidas"] brand:uniqueItems:["nike","adidas","nike","adidas"]
+# expect: array-unique: 400 querystring brand:uniqueItems:["nike","nike"]
+# expect: array-required-missing: 400 querystring brand:required:-
+# expect: scalar-repeated-first-wins: 200 sort=asc
+# expect: scalar-repeated-first-invalid: 400 querystring sort:enum:"up"
+# expect: array-or-null-type: 200
+# expect: array-via-shared-ref: 200 400 querystring tag.0:pattern:"X"
+# expect: numbers-are-strings: 400 querystring page:type:"2"
+# expect: params-bare-names: 200 :id=42 :slug=hello
+# expect: params-invalid: 400 params id:pattern:"x"
+# expect: http-array: 200 400
+
+from lamjson import Json
+from @lam/vulture import InjectResponse, Request, Response, RouteOptions, SchemaIssue, Server
+
+func brands(req: Request, _res: Response) -> str {
+    return f"brand={'|'.join(req.queryAll('brand'))} first={req.query['brand']}"
+}
+
+func sorted(req: Request, _res: Response) -> str {
+    return f"sort={req.query['sort']}"
+}
+
+func ok(_req: Request, _res: Response) -> str {
+    return "ok"
+}
+
+func params(req: Request, _res: Response) -> str {
+    return f":id={req.params[':id']} :slug={req.params[':slug']}"
+}
+
+func issues(where: str, list_: list[SchemaIssue], _req: Request, res: Response) {
+    parts: list[str] = []
+    for issue in list_ {
+        value: str = "-"
+        if issue.hasValue {
+            value = Json.encode(issue.value).unwrap()
+        }
+        parts.append(f"{issue.field}:{issue.keyword}:{value}")
+    }
+    _ = res.code(400).text(where + " " + " ".join(parts))
+}
+
+func main() {
+    srv: Server = Server()
+    srv.setSchemaIssueHandler(issues)
+    srv.addSchema({"$id": "tags", "type": "array", "items": {"type": "string", "pattern": "^[a-z]+$"}})
+    brandQuery: dict[str, any] = {"querystring": {
+        "type": "object",
+        "required": ["brand"],
+        "properties": {
+            "brand": {"type": "array", "minItems": 2, "maxItems": 3, "uniqueItems": true, "items": {"enum": ["nike", "adidas"]}},
+        },
+    }}
+    srv.get("/brands", brands, RouteOptions().withSchema(brandQuery))
+    srv.get("/one", ok, RouteOptions().withSchema({"querystring": {"type": "object", "properties": {"brand": {"type": "array", "items": {"enum": ["nike"]}}}}}))
+    srv.get("/sorted", sorted, RouteOptions().withSchema({"querystring": {"type": "object", "properties": {"sort": {"enum": ["asc", "desc"]}}}}))
+    srv.get("/nullable", ok, RouteOptions().withSchema({"querystring": {"type": "object", "properties": {"x": {"type": ["array", "null"]}}}}))
+    srv.get("/tags", ok, RouteOptions().withSchema({"querystring": {"type": "object", "properties": {"tag": {"$ref": "tags"}}}}))
+    srv.get("/page", ok, RouteOptions().withSchema({"querystring": {"type": "object", "properties": {"page": {"type": "integer"}}}}))
+    srv.get("/posts/:id/:slug", params, RouteOptions().withSchema({"params": {
+        "type": "object",
+        "required": ["id", "slug"],
+        "properties": {"id": {"type": "string", "pattern": "^[0-9]+$"}, "slug": {"type": "string"}},
+    }}))
+
+    r: InjectResponse = srv.inject("GET", "/brands?brand=nike&brand=adidas")
+    print(f"array-two-valid: {r.status} {r.body}")
+    r = srv.inject("GET", "/one?brand=nike")
+    print(f"array-one-valid: {r.status}")
+    r = srv.inject("GET", "/brands?brand=nike&brand=puma")
+    print(f"array-invalid-item: {r.status} {r.body}")
+    r = srv.inject("GET", "/brands?brand=nike")
+    print(f"array-minItems: {r.status} {r.body}")
+    r = srv.inject("GET", "/brands?brand=nike&brand=adidas&brand=nike&brand=adidas")
+    print(f"array-maxItems: {r.status} {r.body}")
+    r = srv.inject("GET", "/brands?brand=nike&brand=nike")
+    print(f"array-unique: {r.status} {r.body}")
+    r = srv.inject("GET", "/brands")
+    print(f"array-required-missing: {r.status} {r.body}")
+    r = srv.inject("GET", "/sorted?sort=asc&sort=up")
+    print(f"scalar-repeated-first-wins: {r.status} {r.body}")
+    r = srv.inject("GET", "/sorted?sort=up&sort=asc")
+    print(f"scalar-repeated-first-invalid: {r.status} {r.body}")
+    r = srv.inject("GET", "/nullable?x=1&x=2")
+    print(f"array-or-null-type: {r.status}")
+    good: InjectResponse = srv.inject("GET", "/tags?tag=a&tag=b")
+    bad: InjectResponse = srv.inject("GET", "/tags?tag=X&tag=b")
+    print(f"array-via-shared-ref: {good.status} {bad.status} {bad.body}")
+    r = srv.inject("GET", "/page?page=2")
+    print(f"numbers-are-strings: {r.status} {r.body}")
+    r = srv.inject("GET", "/posts/42/hello")
+    print(f"params-bare-names: {r.status} {r.body}")
+    r = srv.inject("GET", "/posts/x/hello")
+    print(f"params-invalid: {r.status} {r.body}")
+
+    _ = srv.listenBackground(0).unwrap()
+    address: str = srv.boundAddr
+    goodStatus: int = 0
+    badStatus: int = 0
+    go! {
+        get := func(path string) int {
+            resp, err := http.Get("http://" + address + path)
+            if err != nil {
+                return 0
+            }
+            defer resp.Body.Close()
+            _, _ = io.ReadAll(resp.Body)
+            return resp.StatusCode
+        }
+        goodStatus = get("/brands?brand=adidas&brand=nike")
+        badStatus = get("/brands?brand=adidas&brand=reebok")
+    }
+    srv.close()
+    print(f"http-array: {goodStatus} {badStatus}")
+}
+
+go! {
+    import (
+        "io"
+        "net/http"
+    )
+}

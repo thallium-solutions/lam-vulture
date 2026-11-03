@@ -1,0 +1,195 @@
+# Test: native ``json`` schema values. srv.addSchema and
+# RouteOptions.withSchema used to ignore a ``json`` value silently (only a
+# str or a dict worked); json objects are accepted wherever a schema is,
+# and anything else is refused with a SchemaTypeError at registration.
+#
+# expect: addSchema-json: 200 400
+# expect: withSchema-json: 200 400
+# expect: withSchema-dict-of-json: 200 400
+# expect: withSchema-json-query-params: 200 400 200 400
+# expect: withSchema-json-response: {"id":7}
+# expect: built-in-loop: 200 400
+# expect: overload-json-with-shared-ref: 200 400
+# expect: addSchema-json-array: SchemaTypeError
+# expect: addSchema-json-string: SchemaTypeError
+# expect: addSchema-json-null: SchemaTypeError
+# expect: addSchema-text-array: SchemaTypeError
+# expect: addSchema-text-malformed: SchemaParseError
+# expect: addSchema-int: SchemaTypeError
+# expect: addSchema-without-id: registered=0
+# expect: withSchema-json-array: SchemaTypeError
+# expect: withSchema-json-number: SchemaTypeError
+# expect: withSchema-slot-number: SchemaTypeError
+# expect: withSchema-slot-malformed-text: SchemaParseError
+# expect: withSchema-text: 200 400
+# expect: chained: 200 400
+
+from @lam/vulture import InjectResponse, Request, Response, RouteOptions, Server
+
+func ok(_req: Request, _res: Response) -> str {
+    return "ok"
+}
+
+func item(_req: Request, _res: Response) -> json {
+    return {"id": 7, "secret": "hidden"}
+}
+
+func post(srv: Server, path: str, body: str) -> InjectResponse {
+    return srv.inject("POST", path, body, {"Content-Type": "application/json"})
+}
+
+func kind(err: any) -> str {
+    text: str = str(err)
+    for name in ["SchemaTypeError", "SchemaParseError", "SchemaRefCycleError"] {
+        if text.contains(name) {
+            return name
+        }
+    }
+    return "other: " + text
+}
+
+func priceSchema() -> json {
+    return {"type": "object", "required": ["price"], "properties": {"price": {"$ref": "money"}}}
+}
+
+func main() {
+    srv: Server = Server()
+    money: json = {"$id": "money", "type": "number", "minimum": 0}
+    srv.addSchema(money)
+    srv.post("/price", ok, RouteOptions().withSchema({"body": priceSchema()}))
+    good: InjectResponse = post(srv, "/price", '{"price": 9.5}')
+    bad: InjectResponse = post(srv, "/price", '{"price": -1}')
+    print(f"addSchema-json: {good.status} {bad.status}")
+
+    slots: json = {"body": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string", "minLength": 2}}}}
+    srv.post("/named", ok, RouteOptions().withSchema(slots))
+    good = post(srv, "/named", '{"name": "Ada"}')
+    bad = post(srv, "/named", '{"name": "A"}')
+    print(f"withSchema-json: {good.status} {bad.status}")
+
+    bodySchema: json = {"type": "object", "properties": {"qty": {"type": "integer", "maximum": 5}}}
+    mixed: dict[str, any] = {"body": bodySchema}
+    srv.post("/qty", ok, RouteOptions().withSchema(mixed))
+    good = post(srv, "/qty", '{"qty": 5}')
+    bad = post(srv, "/qty", '{"qty": 6}')
+    print(f"withSchema-dict-of-json: {good.status} {bad.status}")
+
+    qp: json = {
+        "querystring": {"type": "object", "properties": {"sort": {"enum": ["asc", "desc"]}}},
+        "params": {"type": "object", "properties": {"id": {"type": "string", "pattern": "^[0-9]+$"}}},
+    }
+    srv.get("/things/:id", ok, RouteOptions().withSchema(qp))
+    a: InjectResponse = srv.inject("GET", "/things/1?sort=asc")
+    b: InjectResponse = srv.inject("GET", "/things/1?sort=up")
+    c: InjectResponse = srv.inject("GET", "/things/42")
+    d: InjectResponse = srv.inject("GET", "/things/x")
+    print(f"withSchema-json-query-params: {a.status} {b.status} {c.status} {d.status}")
+
+    responses: json = {"response": {"200": {"type": "object", "additionalProperties": false, "properties": {"id": {"type": "integer"}}}}}
+    srv.get("/item", item, RouteOptions().withSchema(responses))
+    print(f"withSchema-json-response: {srv.inject('GET', '/item').body}")
+
+    # A schema assembled at run time.
+    props: json = {}
+    for name in ["x", "y", "z"] {
+        props[name] = {"type": "integer", "minimum": 0}
+    }
+    built: json = {"type": "object", "properties": props, "required": ["x"]}
+    srv.post("/point", ok, RouteOptions().withSchema({"body": built}))
+    good = post(srv, "/point", '{"x": 1, "y": 2}')
+    bad = post(srv, "/point", '{"y": -2}')
+    print(f"built-in-loop: {good.status} {bad.status}")
+
+    srv.post("/overload", ok, priceSchema(), "json")
+    good = post(srv, "/overload", '{"price": 1}')
+    bad = post(srv, "/overload", '{"price": "free"}')
+    print(f"overload-json-with-shared-ref: {good.status} {bad.status}")
+
+    bads: Server = Server()
+    arr: json = [{"$id": "x"}]
+    try {
+        bads.addSchema(arr)
+        print("addSchema-json-array: accepted")
+    } catch err {
+        print(f"addSchema-json-array: {kind(err)}")
+    }
+    jstr: json = json("{\"$id\": \"x\"}")
+    try {
+        bads.addSchema(jstr)
+        print("addSchema-json-string: accepted")
+    } catch err {
+        print(f"addSchema-json-string: {kind(err)}")
+    }
+    jnull: json = None
+    try {
+        bads.addSchema(jnull)
+        print("addSchema-json-null: accepted")
+    } catch err {
+        print(f"addSchema-json-null: {kind(err)}")
+    }
+    try {
+        bads.addSchema("[1, 2]")
+        print("addSchema-text-array: accepted")
+    } catch err {
+        print(f"addSchema-text-array: {kind(err)}")
+    }
+    try {
+        broken: str = "{" + "\"$id\": "
+        bads.addSchema(broken)
+        print("addSchema-text-malformed: accepted")
+    } catch err {
+        print(f"addSchema-text-malformed: {kind(err)}")
+    }
+    try {
+        bads.addSchema(42)
+        print("addSchema-int: accepted")
+    } catch err {
+        print(f"addSchema-int: {kind(err)}")
+    }
+    # Documented: an object without an $id is a no-op.
+    noId: json = {"type": "string"}
+    bads.addSchema(noId)
+    print(f"addSchema-without-id: registered={len(bads.sharedSchemas)}")
+
+    try {
+        _ = RouteOptions().withSchema(arr)
+        print("withSchema-json-array: accepted")
+    } catch err {
+        print(f"withSchema-json-array: {kind(err)}")
+    }
+    num: json = 3
+    try {
+        _ = RouteOptions().withSchema(num)
+        print("withSchema-json-number: accepted")
+    } catch err {
+        print(f"withSchema-json-number: {kind(err)}")
+    }
+    slotNumber: json = {"body": 5}
+    try {
+        _ = RouteOptions().withSchema(slotNumber)
+        print("withSchema-slot-number: accepted")
+    } catch err {
+        print(f"withSchema-slot-number: {kind(err)}")
+    }
+    try {
+        brokenSlot: str = "{" + "\"type\": "
+        _ = RouteOptions().withSchema({"body": brokenSlot})
+        print("withSchema-slot-malformed-text: accepted")
+    } catch err {
+        print(f"withSchema-slot-malformed-text: {kind(err)}")
+    }
+
+    # The slots as JSON text.
+    srv.post("/text", ok, RouteOptions().withSchema('{"body": {"type": "object", "required": ["k"]}}'))
+    good = post(srv, "/text", '{"k": 1}')
+    bad = post(srv, "/text", '{}')
+    print(f"withSchema-text: {good.status} {bad.status}")
+
+    # withSchema composes with the other builders.
+    chained: RouteOptions = RouteOptions(1024).withSchema(slots).metadata("area", "test")
+    chained.summary = "chained"
+    srv.post("/chained", ok, chained)
+    good = post(srv, "/chained", '{"name": "Bo"}')
+    bad = post(srv, "/chained", '{"name": 1}')
+    print(f"chained: {good.status} {bad.status}")
+}
