@@ -1,0 +1,200 @@
+# Test: req.formValues / req.formFieldNames / req.formFields read every text
+# field of urlencoded and multipart bodies (repeated fields, order, empty
+# values, escapes), through Server.inject and route handlers, sharing the
+# parsed form with formField / formFile / formFiles; parsedBody and formField
+# keep their first-value behaviour.
+#
+# expect: repeated: a|b|c q=shoes
+# expect: names: q,brand,size,flag
+# expect: empty: size=1:'' flag=1:''
+# expect: escapes: Caffè latte|München|1+1 = 2|a&b=c names=name,city,expr,k&y
+# expect: absent: 0 names=0 fields=0
+# expect: charset: x|y
+# expect: json-body: 0 0
+# expect: text-body: 0 0
+# expect: no-content-type: 0 0
+# expect: malformed: b=2 names=b parsed=ok
+# expect: parsed-first: a fields=2 brand=a|b
+# expect: copies: a|b|c
+# expect: prefixed: 7:name=Red,7:price=12,9:name=Blue
+# expect: multipart: names=title,tag,note tag=x|y|z note=1:'' files=2 photo=a.png
+# expect: multipart-after-formField: first=x all=x|y|z shared=true file=a.png
+# expect: multipart-file-only: names=0 values=0 files=1
+# expect: multipart-bad: 0 first=fallback
+# expect: limit: 413
+# expect: within-limit: 200 a|b
+
+from @lam/vulture import InjectResponse, Server, Request, Response
+from lamerrors import Result
+
+const Boundary: str = "XyZbOuNdArY"
+
+func joinValues(req: Request, name: str) -> str {
+    return "|".join(req.formValues(name))
+}
+
+func repeated(req: Request, _res: Response) -> str {
+    return f"{joinValues(req, 'brand')} q={joinValues(req, 'q')}"
+}
+
+func names(req: Request, _res: Response) -> str {
+    return ",".join(req.formFieldNames())
+}
+
+func empty(req: Request, _res: Response) -> str {
+    size: list[str] = req.formValues("size")
+    flag: list[str] = req.formValues("flag")
+    return f"size={len(size)}:'{size[0]}' flag={len(flag)}:'{flag[0]}'"
+}
+
+func escapes(req: Request, _res: Response) -> str {
+    values: list[str] = [req.formValues(n)[0] for n in req.formFieldNames()]
+    return f"{'|'.join(values)} names={','.join(req.formFieldNames())}"
+}
+
+func absent(req: Request, _res: Response) -> str {
+    return f"{len(req.formValues('nope'))} names={len(req.formFieldNames())} fields={len(req.formFields())}"
+}
+
+func counts(req: Request, _res: Response) -> str {
+    return f"{len(req.formValues('brand'))} {len(req.formFieldNames())}"
+}
+
+func malformed(req: Request, _res: Response) -> str {
+    # Routed requests see the dispatcher's lenient preParsing result
+    # (unchanged): malformed pairs are dropped, not reported.
+    parsed: Result[any] = req.parsedBody()
+    state: str = "ok" if parsed.ok() else "err"
+    return f"b={joinValues(req, 'b')} names={','.join(req.formFieldNames())} parsed={state}"
+}
+
+func parsedFirst(req: Request, _res: Response) -> str {
+    first: str = ""
+    parsed: any = req.parsedBody().unwrap()
+    if isinstance(parsed, dict) {
+        first = str(parsed["brand"])
+    }
+    fields: dict[str, list[str]] = req.formFields()
+    return f"{first} fields={len(fields)} brand={'|'.join(fields['brand'])}"
+}
+
+func copies(req: Request, _res: Response) -> str {
+    mine: list[str] = req.formValues("brand")
+    mine.append("mutated")
+    fields: dict[str, list[str]] = req.formFields()
+    fields["brand"] = ["replaced"]
+    return joinValues(req, "brand")
+}
+
+func prefixed(req: Request, _res: Response) -> str {
+    # Category fields are posted as ``cat:<id>:<field>``.
+    out: list[str] = []
+    for name in req.formFieldNames() {
+        if not name.startsWith("cat:") {
+            continue
+        }
+        parts: list[str] = name.split(":")
+        out.append(f"{parts[1]}:{parts[2]}={req.formValues(name)[0]}")
+    }
+    return ",".join(out)
+}
+
+func fileName(file: any) -> str {
+    if isinstance(file, dict) {
+        return str(file["filename"])
+    }
+    return "none"
+}
+
+func multipartAll(req: Request, _res: Response) -> str {
+    note: list[str] = req.formValues("note")
+    files: list[any] = req.formFiles("photo")
+    return f"names={','.join(req.formFieldNames())} tag={joinValues(req, 'tag')} note={len(note)}:'{note[0]}' files={len(files)} photo={fileName(files[0])}"
+}
+
+func multipartAfterField(req: Request, _res: Response) -> str {
+    first: str = req.formField("tag")
+    shared: bool = false
+    go! {
+        before := req.Ctx.Get("__lamMultipart", nil)
+        _ = req.FormValues("tag")
+        shared = before != nil && before == req.Ctx.Get("__lamMultipart", nil)
+    }
+    all: str = joinValues(req, "tag")
+    return f"first={first} all={all} shared={shared} file={fileName(req.formFile('photo'))}"
+}
+
+func multipartFileOnly(req: Request, _res: Response) -> str {
+    return f"names={len(req.formFieldNames())} values={len(req.formValues('photo'))} files={len(req.formFiles('photo'))}"
+}
+
+func multipartBad(req: Request, _res: Response) -> str {
+    return f"{len(req.formFieldNames())} first={req.formField('tag', 'fallback')}"
+}
+
+func textPart(name: str, value: str) -> str {
+    return f"--{Boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+}
+
+func filePart(name: str, filename: str, content: str) -> str {
+    return f"--{Boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: image/png\r\n\r\n{content}\r\n"
+}
+
+func multipartBody() -> str {
+    body: str = textPart("title", "Spring") + filePart("photo", "a.png", "PNG1") + textPart("tag", "x")
+    body = body + textPart("tag", "y") + textPart("note", "") + filePart("photo", "b.png", "PNG2")
+    return body + textPart("tag", "z") + f"--{Boundary}--\r\n"
+}
+
+func main() {
+    srv: Server = Server()
+    srv.post("/repeated", repeated)
+    srv.post("/names", names)
+    srv.post("/empty", empty)
+    srv.post("/escapes", escapes)
+    srv.post("/absent", absent)
+    srv.post("/counts", counts)
+    srv.post("/malformed", malformed)
+    srv.post("/parsed-first", parsedFirst)
+    srv.post("/copies", copies)
+    srv.post("/prefixed", prefixed)
+    srv.post("/multipart", multipartAll)
+    srv.post("/multipart-after-field", multipartAfterField)
+    srv.post("/multipart-file-only", multipartFileOnly)
+    srv.post("/multipart-bad", multipartBad)
+
+    form: dict[str, str] = {"Content-Type": "application/x-www-form-urlencoded"}
+    print(f"repeated: {srv.inject('POST', '/repeated', 'brand=a&q=shoes&brand=b&brand=c', form).body}")
+    print(f"names: {srv.inject('POST', '/names', 'q=1&brand=a&size=&brand=b&flag&q=2', form).body}")
+    print(f"empty: {srv.inject('POST', '/empty', 'size=&flag', form).body}")
+    escaped: str = "name=Caff%C3%A8+latte&city=M%C3%BCnchen&expr=1%2B1+%3D+2&k%26y=a%26b%3Dc"
+    print(f"escapes: {srv.inject('POST', '/escapes', escaped, form).body}")
+    print(f"absent: {srv.inject('POST', '/absent', '', form).body}")
+    charset: dict[str, str] = {"content-type": "Application/X-WWW-Form-Urlencoded; charset=UTF-8"}
+    print(f"charset: {srv.inject('POST', '/repeated', 'brand=x&brand=y', charset).body.split(' ')[0]}")
+    jsonType: dict[str, str] = {"Content-Type": "application/json"}
+    print(f"json-body: {srv.inject('POST', '/counts', 'brand=a&brand=b', jsonType).body}")
+    textType: dict[str, str] = {"Content-Type": "text/plain"}
+    print(f"text-body: {srv.inject('POST', '/counts', 'brand=a', textType).body}")
+    print(f"no-content-type: {srv.inject('POST', '/counts', 'brand=a').body}")
+    print(f"malformed: {srv.inject('POST', '/malformed', 'a=%zz&b=2&c;d=1', form).body}")
+    print(f"parsed-first: {srv.inject('POST', '/parsed-first', 'brand=a&size=m&brand=b', form).body}")
+    print(f"copies: {srv.inject('POST', '/copies', 'brand=a&brand=b&brand=c', form).body}")
+    categories: str = "title=x&cat:7:name=Red&cat:7:price=12&other=1&cat:9:name=Blue"
+    print(f"prefixed: {srv.inject('POST', '/prefixed', categories, form).body}")
+
+    multipart: dict[str, str] = {"Content-Type": f"multipart/form-data; boundary={Boundary}"}
+    print(f"multipart: {srv.inject('POST', '/multipart', multipartBody(), multipart).body}")
+    print(f"multipart-after-formField: {srv.inject('POST', '/multipart-after-field', multipartBody(), multipart).body}")
+    fileOnly: str = filePart("photo", "c.png", "PNG3") + f"--{Boundary}--\r\n"
+    print(f"multipart-file-only: {srv.inject('POST', '/multipart-file-only', fileOnly, multipart).body}")
+    noBoundary: dict[str, str] = {"Content-Type": "multipart/form-data"}
+    print(f"multipart-bad: {srv.inject('POST', '/multipart-bad', multipartBody(), noBoundary).body}")
+
+    limited: Server = Server()
+    limited.bodyLimit = 16
+    limited.post("/repeated", repeated)
+    print(f"limit: {limited.inject('POST', '/repeated', 'brand=a&brand=b&brand=c&q=x', form).status}")
+    small: InjectResponse = limited.inject("POST", "/repeated", "brand=a&brand=b", form)
+    print(f"within-limit: {small.status} {small.body.split(' ')[0]}")
+}

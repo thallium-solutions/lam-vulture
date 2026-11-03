@@ -26,7 +26,7 @@ lamc install https://github.com/thallium-solutions/lam-vulture.git
 Install the registry release:
 
 ```bash
-lamc install @lam/vulture@3.1.0
+lamc install @lam/vulture@3.2.0
 ```
 
 Install a local checkout during development:
@@ -233,8 +233,9 @@ The complete public implementation is exported from `__init__.lam`.
   routes, Result-based listeners/TLS, shutdown, typed `inject`, `listRoutes`,
   `printRoutes`, and `openapi`.
 - `Request` — method/path/body/header/query (`queryAll` for repeated parameters)/parameter data, cancellation-aware
-  `ctx`, Result-based JSON/form parsing and cookie verification, multipart
-  bodies, streaming body readers, proxy-aware IP/scheme helpers, decorators,
+  `ctx`, Result-based JSON/form parsing and cookie verification, form fields
+  (`formValues`, `formFieldNames`, `formFields`; below), multipart files,
+  streaming body readers, proxy-aware IP/scheme helpers, decorators,
   request IDs, route metadata, timing, and URL helpers.
 - `Response` — status/header/body builders, JSON/text/HTML/XML/redirect/error
   responses, pagination, cookies and signed cookies, file streaming, SSE,
@@ -245,6 +246,37 @@ The complete public implementation is exported from `__init__.lam`.
 - `RouteOptions` — typed per-route limits, timeout, streaming, hooks, schemas, and metadata.
 - `InjectResponse` — typed `status`, `body`, and `headers` from in-process dispatch.
 - `SseEmitter` — Server-Sent Event data, named events, comments, and close.
+
+### Form fields
+
+These read the text fields of `application/x-www-form-urlencoded` and
+`multipart/form-data` bodies (other content types have none):
+
+| Method | Returns |
+| --- | --- |
+| `req.formValues(name) -> list[str]` | every value of `name` in body order (checkbox groups: `brand=a&brand=b`); `[]` when absent |
+| `req.formFieldNames() -> list[str]` | field names in first-appearance order, without duplicates |
+| `req.formFields() -> dict[str, list[str]]` | every field: name -> values in order |
+| `req.formField(name, fallback = "") -> str` | first value of a multipart field (`fallback` when absent) |
+| `req.formFile(name) -> any` / `req.formFiles(name) -> list[any]` | the first / every file part of a multipart field |
+
+Values are decoded (`+` is a space, `%C3%A8` is `è`); an empty value
+(`size=`, bare `flag`) is `""`. File parts are not text fields: they appear
+only in `formFile` / `formFiles`. Malformed urlencoded pairs are skipped and a
+malformed multipart body has no fields. The body is parsed once, on first use,
+from the buffered body (so the route or server body limit already applied:
+oversized bodies get 413 before the handler) and cached on the request;
+multipart parsing is shared with `formField`, `formFile` and `formFiles`.
+Routes with `streamBody` have no buffered body, hence no fields. The returned
+lists and dicts are copies.
+
+```lammergeier
+func filter(req: Request, res: Response) -> json {
+    brands: list[str] = req.formValues("brand")
+    categories: list[str] = [name for name in req.formFieldNames() if name.startsWith("cat:")]
+    return {"brands": len(brands), "categories": len(categories)}
+}
+```
 
 Route schemas can validate body, query, path parameters, and headers and can
 project response payloads. `listRoutes`, `printRoutes`, `routeOptions`, and

@@ -2,6 +2,18 @@
 
 All notable changes to `@lam/vulture` are documented here.
 
+## [3.2.0] - 2026-11-03
+
+### Added
+
+- `req.formValues(name)`: every value of a form text field in body order
+  (`brand=a&brand=b`), `req.formFieldNames()`: the field names in
+  first-appearance order, and `req.formFields()`: name -> values, for
+  `application/x-www-form-urlencoded` and `multipart/form-data` bodies (file
+  parts excluded: `formFiles`). Parsed once from the buffered body and cached;
+  multipart parsing is shared with `formField` / `formFile` / `formFiles`.
+  `formField` and `parsedBody` are unchanged.
+
 ## [3.1.0] - 2026-11-03
 
 ### Added

@@ -745,6 +745,8 @@ go! {
     type lamMultipartForm struct {
         Fields map[string][]string
         Files  map[string][]*lamMultipartFile
+        // Text field names in first-appearance order (no duplicates).
+        FieldOrder []string
     }
 
     func lamParseMultipart(body string, ct string) (*lamMultipartForm, error) {
@@ -774,6 +776,9 @@ go! {
                 return nil, rerr
             }
             if part.FileName() == "" {
+                if _, seen := form.Fields[part.FormName()]; !seen {
+                    form.FieldOrder = append(form.FieldOrder, part.FormName())
+                }
                 form.Fields[part.FormName()] = append(form.Fields[part.FormName()], string(data))
             } else {
                 form.Files[part.FormName()] = append(form.Files[part.FormName()], &lamMultipartFile{
@@ -800,6 +805,88 @@ go! {
             "size":        f.Size,
             "content":     f.Content,
         }
+    }
+
+    // ─── Form text fields (urlencoded and multipart) ──────────
+    // “lamFormText“ is the ordered view behind “formValues“,
+    // “formFieldNames“ and “formFields“: every value of each text
+    // field plus the names in first-appearance order.
+    type lamFormText struct {
+        Values map[string][]string
+        Order  []string
+    }
+
+    // lamParseURLEncodedOrdered decodes an
+    // “application/x-www-form-urlencoded“ body like “url.ParseQuery“
+    // (“+“ is a space, percent escapes, “k“ alone is “k=“),
+    // keeping the order of the names. Malformed pairs (a “;“, a bad
+    // escape) are skipped, as “url.ParseQuery“ skips them.
+    func lamParseURLEncodedOrdered(body string) *lamFormText {
+        out := &lamFormText{Values: map[string][]string{}}
+        for body != "" {
+            var pair string
+            pair, body, _ = strings.Cut(body, "&")
+            if pair == "" || strings.Contains(pair, ";") {
+                continue
+            }
+            rawKey, rawValue, _ := strings.Cut(pair, "=")
+            key, err := url.QueryUnescape(rawKey)
+            if err != nil {
+                continue
+            }
+            value, err := url.QueryUnescape(rawValue)
+            if err != nil {
+                continue
+            }
+            if _, seen := out.Values[key]; !seen {
+                out.Order = append(out.Order, key)
+            }
+            out.Values[key] = append(out.Values[key], value)
+        }
+        return out
+    }
+
+    // lamRequestFormText returns the request's text form fields,
+    // parsed once from the buffered “req.Body“ (which the transport
+    // already capped at the body limit) and cached on “req.Ctx“:
+    // multipart bodies share “__lamMultipart“ with “formField“ /
+    // “formFile“ / “formFiles“ (whichever runs first parses), and
+    // urlencoded bodies are cached under “__lamUrlencoded“. Other
+    // content types, streamed bodies and malformed multipart bodies
+    // have no fields.
+    func lamRequestFormText(req *Request) *lamFormText {
+        ct := lamReadHeader(req, "Content-Type")
+        lower := strings.ToLower(ct)
+        if strings.HasPrefix(lower, "multipart/form-data") {
+            form, ok := req.Ctx.Get("__lamMultipart", nil).(*lamMultipartForm)
+            if !ok {
+                f, err := lamParseMultipart(req.Body, ct)
+                if err != nil {
+                    return &lamFormText{Values: map[string][]string{}}
+                }
+                req.Ctx.Set("__lamMultipart", f)
+                form = f
+            }
+            order := form.FieldOrder
+            if len(order) != len(form.Fields) {
+                // A form built without the order: fall back to sorted names.
+                order = make([]string, 0, len(form.Fields))
+                for k := range form.Fields {
+                    order = append(order, k)
+                }
+                slices.Sort(order)
+            }
+            return &lamFormText{Values: form.Fields, Order: order}
+        }
+        if lamContentTypeKey(ct) == "application/x-www-form-urlencoded" {
+            if cached, ok := req.Ctx.Get("__lamUrlencoded", nil).(*lamFormText); ok {
+                return cached
+            }
+            parsed := lamParseURLEncodedOrdered(req.Body)
+            req.Ctx.Set("__lamUrlencoded", parsed)
+            return parsed
+        }
+        return &lamFormText{Values: map[string][]string{}}
     }
 
     // ─── Trust-proxy helpers ───────────────────────────────────
@@ -1581,6 +1668,49 @@ class Request {
                         out = acc
                     }
                 }
+            }
+        }
+        return out
+    }
+
+    func formValues(self, name: str) -> list[str] {
+        #- Every value of the text field ``name`` in body order (checkbox
+        groups: ``brand=a&brand=b``), for ``application/x-www-form-urlencoded``
+        and ``multipart/form-data`` bodies; empty when the field is absent or
+        the body is neither. File parts are not text fields (``formFiles``).
+        The parsed form is cached on the request and shared with
+        ``formField`` / ``formFile`` / ``formFiles``. -#
+        out: list[str] = []
+        go! {
+            if values, ok := lamRequestFormText(s).Values[name]; ok {
+                out = slices.Clone(values)
+            }
+        }
+        return out
+    }
+
+    func formFieldNames(self) -> list[str] {
+        #- Names of the text fields of an urlencoded or multipart body in
+        first-appearance order, without duplicates (file parts excluded:
+        see ``formFiles``). Empty for other bodies. -#
+        out: list[str] = []
+        go! {
+            out = slices.Clone(lamRequestFormText(s).Order)
+            if out == nil {
+                out = []string{}
+            }
+        }
+        return out
+    }
+
+    func formFields(self) -> dict[str, list[str]] {
+        #- Every text field of an urlencoded or multipart body: name ->
+        values in body order (a fresh copy; iterate ``formFieldNames()``
+        for the order). Empty for other bodies. -#
+        out: dict[str, list[str]] = {}
+        go! {
+            for k, v := range lamRequestFormText(s).Values {
+                out[k] = slices.Clone(v)
             }
         }
         return out

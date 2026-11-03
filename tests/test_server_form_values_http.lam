@@ -1,0 +1,125 @@
+# Test: formValues / formFieldNames / formFields over a real listener: a
+# browser-style urlencoded checkbox form, a multipart upload mixing repeated
+# text fields and files (read in a preHandler hook and again in the handler:
+# one parse, shared with formFiles), a per-route body limit (413 before any
+# parsing) and a streamed route (no buffered body, hence no fields).
+#
+# expect: urlencoded: names=q,brand,size q=red shoes brand=nike|adidas size=42
+# expect: multipart: hook=3 names=title,tag tag=x|y files=a.txt:5,b.txt:4 parses=1
+# expect: limited: 413
+# expect: limited-small: 200 names=a
+# expect: streamed: names=0 body=brand=a&brand=b
+
+from @lam/vulture import Server, Request, Response, RouteOptions
+
+func describe(req: Request, _res: Response) -> str {
+    fields: dict[str, list[str]] = req.formFields()
+    parts: list[str] = []
+    for name in req.formFieldNames() {
+        values: list[str] = fields[name]
+        parts.append(f"{name}={'|'.join(values)}")
+    }
+    return f"names={','.join(req.formFieldNames())} " + " ".join(parts)
+}
+
+func countFields(req: Request, _res: Response) {
+    # Runs before the handler: parses the multipart body once.
+    total: int = 0
+    for name in req.formFieldNames() {
+        total += len(req.formValues(name))
+    }
+    go! {
+        req.Ctx.Set("hookCount", total)
+        req.Ctx.Set("hookForm", req.Ctx.Get("__lamMultipart", nil))
+    }
+}
+
+func upload(req: Request, _res: Response) -> str {
+    hook: int = 0
+    files: list[str] = []
+    for file in req.formFiles("doc") {
+        if isinstance(file, dict) {
+            files.append(f"{file['filename']}:{file['size']}")
+        }
+    }
+    parses: int = 0
+    go! {
+        hook, _ = req.Ctx.Get("hookCount", 0).(int)
+        if req.Ctx.Get("hookForm", nil) == req.Ctx.Get("__lamMultipart", nil) {
+            parses = 1
+        } else {
+            parses = 2
+        }
+    }
+    return f"hook={hook} names={','.join(req.formFieldNames())} tag={'|'.join(req.formValues('tag'))} files={','.join(files)} parses={parses}"
+}
+
+func limitedNames(req: Request, _res: Response) -> str {
+    return f"names={','.join(req.formFieldNames())}"
+}
+
+func streamed(req: Request, _res: Response) -> str {
+    body: str = str(req.bodyReader().readAll().unwrap())
+    return f"names={len(req.formFieldNames())} body={body}"
+}
+
+func main() {
+    srv: Server = Server()
+    srv.post("/search", describe)
+    uploadOptions: RouteOptions = RouteOptions().preHandler(countFields)
+    srv.post("/upload", upload, uploadOptions)
+    srv.post("/limited", limitedNames, RouteOptions(32))
+    srv.post("/streamed", streamed, RouteOptions(0, 0, true))
+    _ = srv.listenBackground(0).unwrap()
+
+    go! {
+        base := "http://" + srv.BoundAddr
+        defer srv.Shutdown(5000)
+
+        call := func(path string, contentType string, body io.Reader) (int, string) {
+            resp, err := http.Post(base+path, contentType, body)
+            if err != nil {
+                return 0, err.Error()
+            }
+            defer resp.Body.Close()
+            data, _ := io.ReadAll(resp.Body)
+            return resp.StatusCode, string(data)
+        }
+
+        form := "q=red+shoes&brand=nike&size=42&brand=adidas"
+        _, text := call("/search", "application/x-www-form-urlencoded", strings.NewReader(form))
+        fmt.Printf("urlencoded: %s\n", text)
+
+        var buf bytes.Buffer
+        mw := multipart.NewWriter(&buf)
+        mw.WriteField("title", "report")
+        fw, _ := mw.CreateFormFile("doc", "a.txt")
+        fw.Write([]byte("alpha"))
+        mw.WriteField("tag", "x")
+        fw2, _ := mw.CreateFormFile("doc", "b.txt")
+        fw2.Write([]byte("beta"))
+        mw.WriteField("tag", "y")
+        mw.Close()
+        _, up := call("/upload", mw.FormDataContentType(), &buf)
+        fmt.Printf("multipart: %s\n", up)
+
+        big := "a=" + strings.Repeat("x", 64)
+        status, _ := call("/limited", "application/x-www-form-urlencoded", strings.NewReader(big))
+        fmt.Printf("limited: %d\n", status)
+        status, small := call("/limited", "application/x-www-form-urlencoded", strings.NewReader("a=1"))
+        fmt.Printf("limited-small: %d %s\n", status, small)
+
+        _, st := call("/streamed", "application/x-www-form-urlencoded", strings.NewReader("brand=a&brand=b"))
+        fmt.Printf("streamed: %s\n", st)
+    }
+}
+
+go! {
+    import (
+        "bytes"
+        "io"
+        "mime/multipart"
+        "net/http"
+        "strings"
+    )
+}
