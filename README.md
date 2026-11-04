@@ -26,7 +26,7 @@ lamc install https://github.com/thallium-solutions/lam-vulture.git
 Install the registry release:
 
 ```bash
-lamc install @lam/vulture@3.3.0
+lamc install @lam/vulture@3.4.0
 ```
 
 Install a local checkout during development:
@@ -51,7 +51,8 @@ func health(req: Request, res: Response) {
 }
 
 func showUser(req: Request, res: Response) {
-    res.json({"id": req.params[":id"]})
+    id: str = req.params[":id"]
+    res.json({"id": id})
 }
 
 func main() {
@@ -137,9 +138,13 @@ func requireToken(req: Request, res: Response) {
     }
 }
 
+func account(req: Request, res: Response) -> str {
+    return "account"
+}
+
 func protectedRoutes(app: Server) {
     app.preHandler(requireToken)
-    app.get("/account", lambda req, res: res.text("account"))
+    app.get("/account", account)
 }
 
 func main() {
@@ -236,15 +241,21 @@ The complete public implementation is exported from `__init__.lam`.
   `ctx`, Result-based JSON/form parsing and cookie verification, form fields
   (`formValues`, `formFieldNames`, `formFields`; below), multipart files,
   streaming body readers, proxy-aware IP/scheme helpers, decorators,
-  request IDs, route metadata, timing, and URL helpers.
+  request IDs, route metadata (`routeOptions`, `routeMeta`), content
+  negotiation (`acceptsLanguage`, `acceptedLanguages`, `accepts`), timing,
+  and URL helpers.
 - `Response` — status/header/body builders, JSON/text/HTML/XML/redirect/error
-  responses, pagination, cookies and signed cookies, file streaming, SSE,
-  HTTP/2 push, decorators, serialization, response timing, not-found handoff,
-  and connection hijacking.
-- `HttpError` — typed HTTP failures with common status constructors.
+  responses, RFC 9457 problem documents (`problem`), pagination, cookies and
+  signed cookies, file streaming, SSE, HTTP/2 push, decorators,
+  serialization, response timing, not-found handoff, and connection
+  hijacking.
+- `HttpError` — typed HTTP failures with common status constructors,
+  `withRetryAfter` and `toProblem`.
+- `Problem` — an RFC 9457 problem document: type, title, status, detail,
+  instance, extension members, field errors, `Retry-After` / `Allow`.
 - `RequestBodyReader` — Result-based incremental and file-backed request-body consumption.
-- `RouteOptions` — typed per-route limits, timeout, streaming, hooks, schemas, a 413 handler, and metadata.
-- `SchemaIssue` — one schema-validation failure: field path, keyword, message, value.
+- `RouteOptions` — typed per-route limits, timeout, streaming, hooks, schemas (multipart JSON fields included), a 413 handler, and metadata.
+- `SchemaIssue` — one schema-validation failure: field path, keyword, message, value, multipart part.
 - `InjectResponse` — typed `status`, `body`, and `headers` from in-process dispatch.
 - `SseEmitter` — Server-Sent Event data, named events, comments, and close.
 
@@ -279,8 +290,191 @@ func filter(req: Request, res: Response) -> json {
 }
 ```
 
+### Route metadata
+
 `listRoutes`, `printRoutes`, `routeOptions`, and `openapi` expose registered
-route metadata.
+route metadata. `req.routeMeta(name, fallback = "") -> str` reads one entry
+of the matched route's `RouteOptions.metadata` as text — a string as it is,
+a number or boolean formatted (`25`, `1.5`, `true`) — and gives `fallback`
+when the entry is absent, `None` or a list/dict, and when no route matched
+(404s, static files). Guards in hooks use it without reaching into
+`routeOptions()["meta"]`; the 413 handler and encapsulated plugins see it
+too:
+
+```lammergeier
+from @lam/vulture import Request, Response, RouteOptions, Server
+
+func guard(req: Request, res: Response) {
+    if req.routeMeta("access", "public") == "admin" and req.header("X-Role") != "admin" {
+        _ = res.code(403).text("admin only")
+    }
+}
+
+func report(req: Request, res: Response) -> str {
+    return "report"
+}
+
+func main() {
+    app: Server = Server()
+    app.preHandler(guard)
+    app.get("/reports", report, RouteOptions().metadata("access", "admin"))
+    _ = app.listen(8080).unwrap()
+}
+```
+
+## Content negotiation
+
+| Method | Returns |
+| --- | --- |
+| `req.acceptsLanguage(supported, fallback = "") -> str` | the entry of `supported` that `Accept-Language` prefers, spelled as in `supported`; `fallback` when the header is absent or accepts none |
+| `req.acceptedLanguages() -> list[str]` | the header's language ranges in preference order (spelled as sent, `*` kept) |
+| `req.accepts(types, fallback = "") -> str` | the entry of `types` (media types) that `Accept` prefers; the first type when there is no `Accept` header; `fallback` when none is acceptable |
+
+Both headers follow RFC 9110: elements are ordered by q-value, ties keep
+the header order, `q=0` means "not acceptable", and elements with a
+malformed q-value (`q=abc`, `q=1.5`) or a malformed range (`en_US`) are
+ignored. Comparisons are case-insensitive.
+
+`acceptsLanguage` tries the ranges in that order. A range matches the
+supported tag equal to it, else the range shortened subtag by subtag
+(`en-GB` -> `en`, `zh-Hant-TW` -> `zh-Hant` -> `zh`), else the first
+supported tag it is a prefix of (`fr` -> `fr-CA`). `*` takes the first
+supported tag that no other range names. A supported tag covered by a `q=0`
+range is never chosen (`en;q=0` excludes `en` and `en-US`, so
+`en-GB, en;q=0` falls back). `acceptedLanguages` drops `q=0` ranges and
+lists a range repeated in the header once, at its preferred position.
+
+`accepts` gives each offered type the q-value of the most specific range
+that matches it — `text/html;level=1` (parameters must match) beats
+`text/html`, which beats `text/*`, which beats `*/*` (a bare `*` counts as
+`*/*`) — so `application/json;q=0, */*` refuses JSON while accepting
+anything else. The highest q-value wins; ties go to the more specific
+range, then the range earlier in the header, then the type earlier in
+`types`.
+
+```lammergeier
+from @lam/vulture import Problem, Request, Response, Server
+
+const Greetings: dict[str, str] = {"it": "Ciao", "en": "Hello", "fr-CA": "Bonjour"}
+
+func greet(req: Request, res: Response) {
+    lang: str = req.acceptsLanguage(["it", "en", "fr-CA"], "en")
+    _ = res.header("Vary", "Accept, Accept-Language").header("Content-Language", lang)
+    match req.accepts(["application/json", "text/plain"]) {
+        case "application/json" {
+            _ = res.json({"greeting": Greetings[lang]})
+        }
+        case "text/plain" {
+            _ = res.text(Greetings[lang])
+        }
+        case _ {
+            _ = res.problem(Problem(406).withExtension("accepted", ["application/json", "text/plain"]))
+        }
+    }
+}
+
+func main() {
+    app: Server = Server()
+    app.get("/greeting", greet)
+    _ = app.listen(8080).unwrap()
+}
+```
+
+With `Accept-Language: de-CH, it;q=0.8, en;q=0.8` the greeting is Italian
+(`de-CH` is not supported, `it` comes first among the equal weights);
+`en-GB` gives English, `fr` gives `fr-CA`.
+
+## Problem details
+
+`Problem` is an RFC 9457 problem document and `res.problem(p)` sends it:
+
+```lammergeier
+from @lam/vulture import HttpError, Problem, Request, Response, Server
+
+func transfer(req: Request, res: Response) {
+    if req.header("X-Balance") == "0" {
+        p: Problem = Problem(403, "Insufficient funds", "Your balance is 0, the transfer costs 30.", "https://example.com/problems/out-of-credit")
+        _ = res.problem(p.withExtension("balance", 0).withExtension("cost", 30))
+        return
+    }
+    if req.header("X-Busy") != "" {
+        throw HttpError.serviceUnavailable("try again in a minute").withRetryAfter(60)
+    }
+    _ = res.code(204).send("")
+}
+
+func main() {
+    app: Server = Server()
+    app.useProblemDetails("https://example.com/problems/")
+    app.post("/transfers", transfer)
+    _ = app.listen(8080).unwrap()
+}
+```
+
+answers
+
+```text
+403 Forbidden
+Content-Type: application/problem+json
+
+{"balance":0,"cost":30,"detail":"Your balance is 0, the transfer costs 30.","instance":"/transfers","status":403,"title":"Insufficient funds","type":"https://example.com/problems/out-of-credit"}
+```
+
+`Problem(status = 500, title = "", detail = "", type_ = "about:blank", instance = "")`:
+
+| Member | Meaning |
+| --- | --- |
+| `status: int` | the HTTP status |
+| `title: str` | a short summary; `""` renders the RFC 9110 reason phrase (`Not Found`, `Content Too Large`; `Error` for unknown codes) |
+| `detail: str` | this occurrence, for people; left out when `""` |
+| `type_: str` | a URI naming the problem type |
+| `instance: str` | the occurrence; `""` lets `res.problem` use the request path |
+| `extensions: dict[str, json]` | extension members (`withExtension(name, value)`); they never replace the standard members |
+| `errors: list[json]` | field problems, the `errors` member when not empty: `withError(field, message, code = "")` appends `{"field", "message", "code"}`, `withIssues(issues)` appends `json(issue)` of schema issues |
+| `retryAfter: int`, `allow: str` | sent as the `Retry-After` (seconds) and `Allow` headers (`withRetryAfter`, `withAllow`), not in the document |
+
+`json(p)` is the document. `Problem.validation(where, issues, status = 400)`
+builds the problem of a schema-validation failure: `detail` names the part
+of the request (`The request body is not valid.`), the `in` extension is
+`where`, `errors` holds `json(issue)` of every issue. `throw p` (from a hook
+or a handler) sends `p` like `res.problem(p)`, whatever the server options;
+a `Problem` subclass may override `__json__`, and both `throw` and
+`res.problem` render it with the override.
+
+`HttpError(status, message, data)` keeps its JSON envelope
+(`{"statusCode", "error", "message", "data"}`) unless problem details are
+enabled. `err.toProblem(typePrefix = "about:blank")` converts it: the
+reason phrase as title, the message as detail (left out when empty or equal
+to the reason phrase), a dict `data` as extension members (other values as
+the `data` member), `retryAfter`. `withRetryAfter(seconds)` adds
+`Retry-After` in both forms.
+
+### Server-wide problem documents
+
+`srv.useProblemDetails(typePrefix = "about:blank")` makes the server's own
+error answers problem documents (with the request path as `instance`):
+
+| Answer | Problem |
+| --- | --- |
+| a thrown `HttpError` | `err.toProblem(typePrefix)` |
+| unknown path (no not-found handler) | 404, `No route matches GET /x.` |
+| known path, other method | 405, `Allow` kept |
+| body above the limit (no 413 handler) | 413, `The request body exceeds the 1048576 byte limit.` |
+| request timeout (the `onTimeout` hooks wrote no body) | 408 (or the status a hook set), `timeoutMs` extension |
+| unreadable request body | 400 |
+| unhandled error (no error handler) | 500; the error as `detail` in debug mode only |
+| schema validation (no issue handler, no error formatter) | `Problem.validation(where, issues)`, 400 |
+
+`type` is `about:blank`, or `typePrefix` followed by the reason phrase as a
+slug: with `https://example.com/problems/` a 404 is
+`https://example.com/problems/not-found`, a 413
+`.../content-too-large`, a validation failure `.../validation-failed`.
+Handlers you install (`setNotFoundHandler`, `setPayloadTooLargeHandler`,
+`setErrorHandler`, `setSchemaIssueHandler`, `setSchemaErrorFormatter`) keep
+answering, and `onSend` hooks see the problem documents. The option is off
+by default: the plain-text `404 not found` / `405 method not allowed` /
+`413 payload too large` / `internal server error` bodies and the JSON
+envelopes stay. `srv.problemDetails = false` turns it off again.
 
 ## Validation
 
@@ -322,8 +516,10 @@ func main() {
 }
 ```
 
-The slots are `body`, `querystring` (or `query`), `params`, `headers` and
-`response` (keyed by status: `"200"`, `"2xx"`, `"default"`). The slot map and
+The slots are `body`, `querystring` (or `query`), `params`, `headers`,
+`response` (keyed by status: `"200"`, `"2xx"`, `"default"`) and
+`multipartJson` (keyed by multipart field; see
+[Multipart JSON fields](#multipart-json-fields)). The slot map and
 every schema may be a native `json` object, a `dict` or JSON text;
 `withSchema` refuses anything else at once — a `json` array or scalar, a
 number, malformed JSON — with `SchemaTypeError` / `SchemaParseError` (YAML and
@@ -343,6 +539,59 @@ What each slot validates:
   `req.params[":id"]`.
 - `headers`: an object of the request headers with lower-case names
   (`"x-api-key"`), first value of each.
+- `multipartJson`: the JSON documents of named multipart text fields
+  (below).
+
+### Multipart JSON fields
+
+An upload that sends files with a JSON document in a text field (`data`)
+gets that document validated like a JSON body:
+
+```lammergeier
+from lamjson import Json
+from @lam/vulture import Request, Response, RouteOptions, Server
+
+func createProduct(req: Request, res: Response) -> json {
+    product: json = Json.decode(req.formField("data")).unwrap()
+    return {"name": product["name"], "photos": len(req.formFiles("photo"))}
+}
+
+func main() {
+    app: Server = Server()
+    app.addSchema({"$id": "money", "type": "number", "minimum": 0})
+    product: json = {
+        "type": "object",
+        "required": ["name", "price"],
+        "additionalProperties": false,
+        "properties": {"name": {"type": "string", "minLength": 1}, "price": {"$ref": "money"}},
+    }
+    # The same schema for JSON requests (body) and multipart ones (data).
+    options: RouteOptions = RouteOptions(10485760).withSchema({"body": product, "multipartJson": {"data": product}})
+    app.post("/products", createProduct, options)
+    _ = app.listen(8080).unwrap()
+}
+```
+
+`RouteOptions.multipartJsonSchema(field, schema)` does the same for one
+field (it wins over the slot for that field). On a `multipart/form-data`
+request each named field — its first value — is decoded as JSON and
+validated before the `preHandler` hooks, with shared `$ref` fragments
+resolved as for body schemas; the `body` schema is skipped (the body is
+not JSON). Requests of other content types keep the `body` schema. An
+absent field is a `required` issue, malformed JSON a `parse` issue.
+Failures go through the issue handler, the formatter or the default
+answer with `where == "multipart"`: `SchemaIssue.part` is the field
+(`"data"`) and `SchemaIssue.field` the path inside its document
+(`"price"`), so the issues of a JSON body and of the multipart part have
+the same field names; the formatter's messages are prefixed with the field
+(`"data: Must be greater than or equal to 0"`). The multipart form is
+parsed once and shared with `formField` / `formFile` / `formFiles`.
+`streamBody` routes have no buffered body: a `preValidation` hook that
+reads it into `req.body` gets it validated. `openapi()` describes the
+fields as `multipart/form-data` properties with an `application/json`
+encoding. A field name that is empty or a schema that is not an object
+raises `SchemaTypeError` / `SchemaParseError`; a `$ref` cycle raises
+`SchemaRefCycleError` at registration.
 
 ### Shared schemas
 
@@ -370,13 +619,17 @@ A failed validation answers 400. By default the body is
 - `srv.setSchemaIssueHandler(handler)` — `func(where: str, issues:
   list[SchemaIssue], req: Request, res: Response)` writes the whole
   response: status (preset to 400), headers, Content-Type, body. `where`
-  is `"body"`, `"querystring"`, `"params"` or `"headers"`. A handler that
+  is `"body"`, `"querystring"`, `"params"`, `"headers"` or `"multipart"`. A handler that
   sends nothing, or raises, falls back to the formatter or the default.
   `clearSchemaIssueHandler()` removes it.
 - `srv.setSchemaErrorFormatter(formatter)` — `func(where: str, errs:
   list[str], req: Request) -> any` returns the body only: a dict is sent
   as `application/json; charset=utf-8`, a `str` as `text/plain`. The issue
   handler wins when both are installed.
+
+Without either, `srv.useProblemDetails()` answers with
+`Problem.validation(where, issues)` (`application/problem+json`, the issues
+under `errors`).
 
 Each `SchemaIssue` has:
 
@@ -386,26 +639,21 @@ Each `SchemaIssue` has:
 | `keyword: str` | the JSON Schema keyword: `required`, `type`, `enum`, `const`, `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `minLength`, `maxLength`, `pattern`, `format`, `minItems`, `maxItems`, `uniqueItems`, `additionalProperties`, `propertyNames`, `dependencies`, `anyOf`, `oneOf`, `allOf`, `not`, …; `parse` for a malformed document, `schema` for a schema that does not compile, `xsd` for XSD failures |
 | `message: str` | the validator's description (what the formatter receives) |
 | `value: json`, `hasValue: bool` | the offending value, when there is one (`required` has none) |
+| `part: str` | for `where == "multipart"`, the multipart field whose document failed; `""` otherwise |
 
-Issues are sorted by field (array indexes numerically), then keyword.
-`json(issue)` gives `{"field", "keyword", "message", "value"}` (`value` only
-when `hasValue`).
+Issues are sorted by field (array indexes numerically), then keyword
+(multipart issues by part first).
+`json(issue)` gives `{"field", "keyword", "message", "value", "part"}`
+(`value` only when `hasValue`, `part` only when set).
 
 ```lammergeier
-from lamjson import Json
-from @lam/vulture import Request, Response, SchemaIssue, Server
+from @lam/vulture import Problem, Request, Response, SchemaIssue, Server
 
 func validationProblem(where: str, issues: list[SchemaIssue], req: Request, res: Response) {
-    errors: list[json] = [json(issue) for issue in issues]
-    doc: json = {
-        "type": "https://example.com/problems/validation",
-        "title": "The request is not valid",
-        "status": 422,
-        "instance": req.path,
-        "in": where,
-        "errors": errors,
-    }
-    _ = res.code(422).type_("application/problem+json").send(Json.encode(doc).unwrap())
+    p: Problem = Problem.validation(where, issues, 422)
+    p.type_ = "https://example.com/problems/validation"
+    p.title = "The request is not valid"
+    _ = res.problem(p)
 }
 
 func main() {
@@ -426,7 +674,8 @@ refusing extra properties gives the issues `extra` / `additionalProperties`
 route's limit, when set, replaces the server's. A body above the limit is
 refused with 413 **before any hook runs**, over HTTP (the transport stops
 reading) and through `inject` alike. The default response is
-`413 payload too large` (`text/plain; charset=utf-8`).
+`413 payload too large` (`text/plain; charset=utf-8`), or a problem document
+with `useProblemDetails`.
 
 `srv.setPayloadTooLargeHandler(handler)` — `func(req: Request, res:
 Response)` — shapes every 413; `RouteOptions.onPayloadTooLarge(handler)`
@@ -438,8 +687,8 @@ set are kept) or raises, the default text answers.
 
 ```lammergeier
 func tooLarge(req: Request, res: Response) {
-    doc: json = {"type": "about:blank", "title": "Payload Too Large", "status": 413, "instance": req.path}
-    _ = res.code(413).type_("application/problem+json").send(Json.encode(doc).unwrap())
+    limit: str = req.routeMeta("limitText", "10 MiB")
+    _ = res.problem(Problem(413, "", f"Uploads are limited to {limit}."))
 }
 
 app.setPayloadTooLargeHandler(tooLarge)
@@ -450,7 +699,7 @@ On `streamBody` routes nothing is buffered: the limit trips while the
 handler reads (`reader.readAll()` returns the 413 `HttpError`). When that
 failure escapes the handler — `unwrap()` raising, or the `HttpError` raised
 again — the 413 handler answers; without one, the `HttpError` is rendered
-as JSON as before.
+as JSON as before (a problem document with `useProblemDetails`).
 
 ## Security notes
 

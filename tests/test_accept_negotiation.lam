@@ -1,0 +1,145 @@
+# Test: content negotiation on the request.
+#
+# req.acceptsLanguage(supported, fallback) picks the supported language an
+# Accept-Language header prefers (RFC 9110 q-values, ties in header order,
+# q=0 excludes, `*`, region fallback en-GB -> en, prefix match fr -> fr-CA,
+# case-insensitive, the supported spelling returned); req.acceptedLanguages()
+# lists the header's ranges in preference order; req.accepts(types, fallback)
+# picks the offered media type an Accept header prefers (most specific range
+# wins, q=0 excludes, ties by specificity then header order).
+#
+# expect: lang-exact: en
+# expect: lang-q-order: en
+# expect: lang-region-fallback: en
+# expect: lang-case: en
+# expect: lang-tie-header-order: it
+# expect: lang-q0-excluded: it
+# expect: lang-star: it
+# expect: lang-star-minus-excluded: en
+# expect: lang-unsupported-fallback: it
+# expect: lang-absent-fallback: [] [xx]
+# expect: lang-prefix-match: fr-CA
+# expect: lang-truncate-long: fr-CA
+# expect: lang-invalid-q: fr-CA
+# expect: lang-region-excluded: none
+# expect: lang-star-low: it
+# expect: lang-whitespace: en
+# expect: lang-supported-case: en-GB
+# expect: lang-empty-supported: fb
+# expect: accepted: en-GB,de,fr,*
+# expect: accepted-dedupe: EN,it
+# expect: accepted-invalid: it,en-US
+# expect: accepted-absent: 0
+# expect: type-exact: application/json
+# expect: type-absent: text/html
+# expect: type-q: application/json
+# expect: type-any: text/html
+# expect: type-wildcard-subtype: text/plain
+# expect: type-specific-q0: text/csv
+# expect: type-none: [] [none]
+# expect: type-tie-header-order: text/html
+# expect: type-case: text/html
+# expect: type-params: text/html;level=1
+# expect: type-specificity-tie: application/json
+# expect: type-bare-star: application/xml
+# expect: type-malformed: application/xml
+# expect: inject: lang=en type=application/json vary=Accept-Language
+# expect: http: lang=fr-CA type=text/html
+
+from @lam/vulture import InjectResponse, Request, Response, Server
+
+const Supported: list[str] = ["it", "en", "fr-CA"]
+
+func withHeader(name: str, value: str) -> Request {
+    req: Request = Request()
+    req.headers[name] = value
+    return req
+}
+
+func lang(header: str, fallback: str = "") -> str {
+    return withHeader("Accept-Language", header).acceptsLanguage(Supported, fallback)
+}
+
+func offered(header: str, types: list[str], fallback: str = "") -> str {
+    return withHeader("Accept", header).accepts(types, fallback)
+}
+
+func negotiate(req: Request, res: Response) -> str {
+    chosen: str = req.acceptsLanguage(Supported, "it")
+    kind: str = req.accepts(["text/html", "application/json"])
+    _ = res.header("Vary", "Accept-Language")
+    return f"lang={chosen} type={kind}"
+}
+
+func main() {
+    print(f"lang-exact: {lang('en')}")
+    print(f"lang-q-order: {lang('fr;q=0.5, en;q=0.9')}")
+    print(f"lang-region-fallback: {lang('en-GB')}")
+    print(f"lang-case: {lang('EN-us')}")
+    print(f"lang-tie-header-order: {lang('de, it;q=0.8, en;q=0.8')}")
+    print(f"lang-q0-excluded: {lang('en;q=0, it;q=0.1')}")
+    print(f"lang-star: {lang('*')}")
+    print(f"lang-star-minus-excluded: {lang('*, it;q=0')}")
+    print(f"lang-unsupported-fallback: {lang('de', 'it')}")
+    empty: Request = Request()
+    print(f"lang-absent-fallback: [{empty.acceptsLanguage(Supported)}] [{empty.acceptsLanguage(Supported, 'xx')}]")
+    print(f"lang-prefix-match: {lang('fr')}")
+    print(f"lang-truncate-long: {lang('fr-CA-x-quebec')}")
+    print(f"lang-invalid-q: {lang('en;q=abc, it;q=1.5, fr-CA;q=0.3')}")
+    print(f"lang-region-excluded: {lang('en-GB, en;q=0', 'none')}")
+    print(f"lang-star-low: {lang('de-CH, de;q=0.9, *;q=0.1')}")
+    print(f"lang-whitespace: {lang(' , en ;  q=0.7 ,, it;q=0.6')}")
+    regional: list[str] = ["en-US", "en-GB", "it"]
+    print(f"lang-supported-case: {withHeader('Accept-Language', 'en-gb, en;q=0.8').acceptsLanguage(regional)}")
+    nothing: list[str] = []
+    print(f"lang-empty-supported: {withHeader('Accept-Language', 'en').acceptsLanguage(nothing, 'fb')}")
+
+    print(f"accepted: {','.join(withHeader('Accept-Language', 'fr;q=0.5, en-GB, de;q=0.8, *;q=0.1, it;q=0').acceptedLanguages())}")
+    print(f"accepted-dedupe: {','.join(withHeader('Accept-Language', 'en;q=0.2, it;q=0.5, EN;q=0.9').acceptedLanguages())}")
+    print(f"accepted-invalid: {','.join(withHeader('Accept-Language', 'en_US, 123456789, it, en-US;q=0.4').acceptedLanguages())}")
+    print(f"accepted-absent: {len(Request().acceptedLanguages())}")
+
+    pair: list[str] = ["text/html", "application/json"]
+    print(f"type-exact: {offered('application/json', pair)}")
+    print(f"type-absent: {Request().accepts(pair)}")
+    print(f"type-q: {offered('text/html;q=0.5, application/json', pair)}")
+    print(f"type-any: {offered('*/*', pair)}")
+    print(f"type-wildcard-subtype: {offered('text/*', ['application/json', 'text/plain'])}")
+    print(f"type-specific-q0: {offered('application/json;q=0, */*', ['application/json', 'text/csv'])}")
+    print(f"type-none: [{offered('image/png', pair)}] [{offered('image/png', pair, 'none')}]")
+    print(f"type-tie-header-order: {offered('text/html, application/json', ['application/json', 'text/html'])}")
+    print(f"type-case: {offered('TEXT/HTML', pair)}")
+    print(f"type-params: {offered('text/*;q=0.3, text/html;q=0.7, text/html;level=1, */*;q=0.1', ['text/plain', 'text/html;level=1', 'image/png'])}")
+    print(f"type-specificity-tie: {offered('application/json;q=0.5, text/*;q=0.5', ['text/plain', 'application/json'])}")
+    print(f"type-bare-star: {offered('*', ['application/xml', 'text/html'])}")
+    print(f"type-malformed: {offered('foo, application/xml', ['text/html', 'application/xml'])}")
+
+    srv: Server = Server()
+    srv.get("/negotiate", negotiate)
+    r: InjectResponse = srv.inject("GET", "/negotiate", "", {"Accept-Language": "de, en;q=0.9", "Accept": "application/json"})
+    print(f"inject: {r.body} vary={r.header('Vary')}")
+
+    _ = srv.listenBackground(0).unwrap()
+    address: str = srv.boundAddr
+    body: str = ""
+    go! {
+        request, _ := http.NewRequest("GET", "http://"+address+"/negotiate", nil)
+        request.Header.Set("Accept-Language", "fr-FR;q=0.4, fr;q=0.6, de")
+        request.Header.Set("Accept", "text/html, */*;q=0.1")
+        resp, err := http.DefaultClient.Do(request)
+        if err == nil {
+            data, _ := io.ReadAll(resp.Body)
+            resp.Body.Close()
+            body = string(data)
+        }
+    }
+    srv.close()
+    print(f"http: {body}")
+}
+
+go! {
+    import (
+        "io"
+        "net/http"
+    )
+}

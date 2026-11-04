@@ -125,6 +125,9 @@ go! {
         ParamsSchema    string
         HeadersSchema   string
         ResponseSchemas map[string]string
+        // Multipart text field -> JSON Schema text of its JSON document
+        // (“multipartJson“ slot / “RouteOptions.multipartJsonSchema“).
+        MultipartJsonSchemas map[string]string
         // Misc metadata that surfaces in “listRoutes“ and the
         // OpenAPI generator.
         OperationId string
@@ -218,6 +221,14 @@ go! {
             }
             if typed.SchemaValue != nil {
                 lamPopulateSchemaSlots(out, typed.SchemaValue)
+            }
+            for field, schema := range typed.MultipartJson {
+                if text, err := json.Marshal(schema); err == nil {
+                    if out.MultipartJsonSchemas == nil {
+                        out.MultipartJsonSchemas = map[string]string{}
+                    }
+                    out.MultipartJsonSchemas[field] = string(text)
+                }
             }
             return out
         }
@@ -367,6 +378,15 @@ go! {
                     }
                     for code, sub := range rm {
                         out.ResponseSchemas[strings.ToLower(code)] = toText(sub)
+                    }
+                }
+            case "multipartjson":
+                if fm, ok := v.(map[string]interface{}); ok {
+                    if out.MultipartJsonSchemas == nil {
+                        out.MultipartJsonSchemas = map[string]string{}
+                    }
+                    for field, sub := range fm {
+                        out.MultipartJsonSchemas[field] = toText(sub)
                     }
                 }
             }
@@ -1135,6 +1155,19 @@ go! {
                         return nil, err
                     }
                 }
+            case "multipartjson":
+                fields, ok := value.(map[string]interface{})
+                if !ok {
+                    return nil, fmt.Errorf("SchemaTypeError: the multipartJson schemas must be an object keyed by multipart field, got %s", lamSchemaKind(value))
+                }
+                for field, sub := range fields {
+                    if strings.TrimSpace(field) == "" {
+                        return nil, fmt.Errorf("SchemaTypeError: a multipartJson schema needs a field name")
+                    }
+                    if err := lamCheckSchemaSlot(sub, "multipartJson "+field, "json"); err != nil {
+                        return nil, err
+                    }
+                }
             }
         }
         return obj, nil
@@ -1151,6 +1184,9 @@ go! {
             texts = append(texts, opts.BodySchema)
         }
         for _, text := range opts.ResponseSchemas {
+            texts = append(texts, text)
+        }
+        for _, text := range opts.MultipartJsonSchemas {
             texts = append(texts, text)
         }
         for _, text := range texts {
@@ -1364,7 +1400,7 @@ go! {
                 message, _ := issue["description"].(string)
                 kind, hasKind := issue["keyword"].(string)
                 if !hasKind {
-                    out = append(out, NewSchemaIssue("", "xsd", message, lamJSONWrapRaw(nil), false))
+                    out = append(out, NewSchemaIssue("", "xsd", message, lamJSONWrapRaw(nil), false, ""))
                     continue
                 }
                 field, _ := issue["field"].(string)
@@ -1396,7 +1432,7 @@ go! {
                 if err != nil {
                     normalized, hasValue = nil, false
                 }
-                out = append(out, NewSchemaIssue(field, keyword, message, lamJSONWrapRaw(normalized), hasValue))
+                out = append(out, NewSchemaIssue(field, keyword, message, lamJSONWrapRaw(normalized), hasValue, ""))
             }
         }
         if len(out) == 0 {
@@ -1409,7 +1445,7 @@ go! {
             case "SchemaFormatError":
                 keyword = "schemaFormat"
             }
-            out = append(out, NewSchemaIssue("", keyword, failure.message, lamJSONWrapRaw(nil), false))
+            out = append(out, NewSchemaIssue("", keyword, failure.message, lamJSONWrapRaw(nil), false, ""))
         }
         slices.SortStableFunc(out, func(a, b *SchemaIssue) int {
             if c := lamCompareIssueFields(a.Field, b.Field); c != 0 {
@@ -1591,15 +1627,501 @@ go! {
         return fmt.Sprintf("%012x%s", n&0xFFFFFFFFFFFF, hex.EncodeToString(rnd[:]))
     }
 
+    // ─── Content negotiation (RFC 9110 §12.5) ──────────────
+    // One element of an Accept / Accept-Language header: the value
+    // (a language range or a media range), its lower-cased parameters
+    // other than “q“, the weight and the position in the header.
+    type lamQEntry struct {
+        value  string
+        params map[string]string
+        q      float64
+        index  int
+    }
+
+    // lamParseQ reads a “q“ weight: 0 to 1 with at most three
+    // decimals (RFC 9110 §12.4.2). Anything else is malformed.
+    func lamParseQ(raw string) (float64, bool) {
+        raw = strings.TrimSpace(raw)
+        if raw == "" || len(raw) > 5 {
+            return 0, false
+        }
+        for i, c := range raw {
+            if !(c >= '0' && c <= '9') && !(c == '.' && i == 1) {
+                return 0, false
+            }
+        }
+        if raw[0] != '0' && raw[0] != '1' {
+            return 0, false
+        }
+        q, err := strconv.ParseFloat(raw, 64)
+        if err != nil || q < 0 || q > 1 {
+            return 0, false
+        }
+        return q, true
+    }
+
+    // lamParseQList splits a comma-separated weighted header. Elements
+    // with a malformed weight are dropped; “valid“ filters the values.
+    // The result is sorted by weight, stable (ties keep header order).
+    func lamParseQList(header string, valid func(string) bool) []lamQEntry {
+        out := []lamQEntry{}
+        for index, element := range strings.Split(header, ",") {
+            pieces := strings.Split(element, ";")
+            value := strings.TrimSpace(pieces[0])
+            if value == "" || !valid(value) {
+                continue
+            }
+            entry := lamQEntry{value: value, params: map[string]string{}, q: 1, index: index}
+            ok := true
+            for _, piece := range pieces[1:] {
+                name, raw, _ := strings.Cut(strings.TrimSpace(piece), "=")
+                name = strings.ToLower(strings.TrimSpace(name))
+                raw = strings.Trim(strings.TrimSpace(raw), "\"")
+                if name == "" {
+                    continue
+                }
+                if name == "q" {
+                    q, good := lamParseQ(raw)
+                    if !good {
+                        ok = false
+                        break
+                    }
+                    entry.q = q
+                    continue
+                }
+                entry.params[name] = raw
+            }
+            if ok {
+                out = append(out, entry)
+            }
+        }
+        slices.SortStableFunc(out, func(a, b lamQEntry) int {
+            switch {
+            case a.q > b.q:
+                return -1
+            case a.q < b.q:
+                return 1
+            }
+            return 0
+        })
+        return out
+    }
+
+    // lamValidLanguageRange: “*“ or 1*8ALPHA *("-" 1*8alphanum)
+    // (RFC 4647 §2.1).
+    func lamValidLanguageRange(value string) bool {
+        if value == "*" {
+            return true
+        }
+        for i, sub := range strings.Split(value, "-") {
+            if len(sub) == 0 || len(sub) > 8 {
+                return false
+            }
+            for _, c := range sub {
+                alpha := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                digit := c >= '0' && c <= '9'
+                if !alpha && !(digit && i > 0) {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
+    // lamLanguageCovers: the range “rng“ matches the tag “tag“ by
+    // basic filtering (RFC 4647 §3.3.1): equal, or a prefix ending
+    // at a “-“, case-insensitively.
+    func lamLanguageCovers(rng, tag string) bool {
+        rng = strings.ToLower(rng)
+        tag = strings.ToLower(tag)
+        return rng == tag || strings.HasPrefix(tag, rng+"-")
+    }
+
+    // lamAcceptedLanguages: the language ranges of “header“ in
+    // preference order, q=0 and malformed elements excluded, each
+    // range once (case-insensitively) at its preferred position.
+    func lamAcceptedLanguages(header string) []string {
+        out := []string{}
+        seen := map[string]bool{}
+        for _, entry := range lamParseQList(header, lamValidLanguageRange) {
+            key := strings.ToLower(entry.value)
+            if entry.q <= 0 || seen[key] {
+                seen[key] = true
+                continue
+            }
+            seen[key] = true
+            out = append(out, entry.value)
+        }
+        return out
+    }
+
+    // lamNegotiateLanguage picks the supported tag “header“ prefers.
+    // For each range by weight (ties in header order): the supported
+    // tag equal to it, else the range truncated subtag by subtag
+    // (lookup, RFC 4647 §3.4: en-GB -> en), else the first supported
+    // tag the range covers (fr -> fr-CA). “*“ takes the first
+    // supported tag no other range names. A supported tag covered by
+    // a q=0 range is never chosen. "" when nothing is acceptable.
+    func lamNegotiateLanguage(header string, supported []string) string {
+        entries := lamParseQList(header, lamValidLanguageRange)
+        excluded := func(tag string) bool {
+            for _, e := range entries {
+                if e.q <= 0 && e.value != "*" && lamLanguageCovers(e.value, tag) {
+                    return true
+                }
+            }
+            return false
+        }
+        named := func(tag string) bool {
+            for _, e := range entries {
+                if e.value != "*" && lamLanguageCovers(e.value, tag) {
+                    return true
+                }
+            }
+            return false
+        }
+        candidates := []string{}
+        for _, tag := range supported {
+            if strings.TrimSpace(tag) != "" && lamValidLanguageRange(tag) && tag != "*" && !excluded(tag) {
+                candidates = append(candidates, tag)
+            }
+        }
+        for _, e := range entries {
+            if e.q <= 0 {
+                continue
+            }
+            if e.value == "*" {
+                for _, tag := range candidates {
+                    if !named(tag) {
+                        return tag
+                    }
+                }
+                continue
+            }
+            for rng := e.value; rng != ""; {
+                for _, tag := range candidates {
+                    if strings.EqualFold(tag, rng) {
+                        return tag
+                    }
+                }
+                cut := strings.LastIndex(rng, "-")
+                if cut < 0 {
+                    break
+                }
+                rng = rng[:cut]
+                // A trailing singleton (“x“ of “-x-...“) goes too.
+                if c := strings.LastIndex(rng, "-"); c >= 0 && len(rng)-c == 2 {
+                    rng = rng[:c]
+                }
+            }
+            for _, tag := range candidates {
+                if lamLanguageCovers(e.value, tag) {
+                    return tag
+                }
+            }
+        }
+        return ""
+    }
+
+    // lamValidMediaRange: “type/subtype“ tokens (“*“ allowed), or a
+    // bare “*“ (sent by some clients for “*/*“).
+    func lamValidMediaRange(value string) bool {
+        if value == "*" {
+            return true
+        }
+        kind, sub, ok := strings.Cut(value, "/")
+        return ok && kind != "" && sub != "" && !strings.ContainsAny(value, " \t") && !strings.Contains(sub, "/")
+    }
+
+    // lamSplitMediaType lower-cases a media type and its parameters.
+    func lamSplitMediaType(value string) (string, string, map[string]string) {
+        pieces := strings.Split(value, ";")
+        full := strings.ToLower(strings.TrimSpace(pieces[0]))
+        if full == "*" {
+            full = "*/*"
+        }
+        kind, sub, _ := strings.Cut(full, "/")
+        params := map[string]string{}
+        for _, piece := range pieces[1:] {
+            name, raw, _ := strings.Cut(strings.TrimSpace(piece), "=")
+            name = strings.ToLower(strings.TrimSpace(name))
+            if name != "" && name != "q" {
+                params[name] = strings.Trim(strings.TrimSpace(raw), "\"")
+            }
+        }
+        return kind, sub, params
+    }
+
+    // lamNegotiateMedia picks the offered media type “header“
+    // prefers. Each offer takes the weight of the most specific range
+    // matching it (type/subtype with parameters > type/subtype >
+    // type/* > */*); the best weight wins (q=0 is not acceptable),
+    // then the more specific range, the earlier range in the header,
+    // the earlier offer. Without a header every offer is acceptable:
+    // the first one. "" when nothing is acceptable.
+    func lamNegotiateMedia(header string, offers []string) string {
+        if strings.TrimSpace(header) == "" {
+            for _, offer := range offers {
+                if strings.TrimSpace(offer) != "" {
+                    return offer
+                }
+            }
+            return ""
+        }
+        entries := lamParseQList(header, func(v string) bool { return lamValidMediaRange(v) })
+        best := ""
+        bestQ, bestSpec, bestIndex := 0.0, -1, 0
+        for _, offer := range offers {
+            if strings.TrimSpace(offer) == "" {
+                continue
+            }
+            kind, sub, params := lamSplitMediaType(offer)
+            q, spec, index := 0.0, -1, 0
+            for _, e := range entries {
+                ek, es, eparams := lamSplitMediaType(e.value)
+                for name, value := range e.params {
+                    eparams[name] = value
+                }
+                s := 0
+                switch {
+                case ek == kind && es == sub:
+                    s = 2
+                case ek == kind && es == "*":
+                    s = 1
+                case ek == "*" && es == "*":
+                    s = 0
+                default:
+                    continue
+                }
+                matches := true
+                for name, value := range eparams {
+                    if params[name] != value {
+                        matches = false
+                        break
+                    }
+                }
+                if !matches {
+                    continue
+                }
+                s = s*100 + len(eparams)
+                if s > spec || (s == spec && e.index < index) {
+                    q, spec, index = e.q, s, e.index
+                }
+            }
+            if spec < 0 || q <= 0 {
+                continue
+            }
+            if q > bestQ || (q == bestQ && (spec > bestSpec || (spec == bestSpec && index < bestIndex))) {
+                best, bestQ, bestSpec, bestIndex = offer, q, spec, index
+            }
+        }
+        return best
+    }
+
+    // ─── Problem details (RFC 9457) ────────────────────────
+    const lamProblemContentType = "application/problem+json"
+
+    // lamProblemTitle: the RFC 9110 reason phrase of “status“
+    // ("Error" when the status has none). Go's table still has the
+    // RFC 7231 names of 413 and 422.
+    func lamProblemTitle(status int) string {
+        switch status {
+        case 413:
+            return "Content Too Large"
+        case 422:
+            return "Unprocessable Content"
+        }
+        if text := http.StatusText(status); text != "" {
+            return text
+        }
+        return "Error"
+    }
+
+    // lamProblemSlug: the reason phrase as a URI segment
+    // ("I'm a teapot" -> "im-a-teapot"); "status-<n>" without one.
+    func lamProblemSlug(status int) string {
+        if http.StatusText(status) == "" {
+            return "status-" + strconv.Itoa(status)
+        }
+        text := lamProblemTitle(status)
+        var b strings.Builder
+        dash := false
+        for _, c := range strings.ToLower(text) {
+            switch {
+            case (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'):
+                if dash && b.Len() > 0 {
+                    b.WriteByte('-')
+                }
+                dash = false
+                b.WriteRune(c)
+            case c == ' ' || c == '-':
+                dash = true
+            }
+        }
+        return b.String()
+    }
+
+    // lamProblemType: the “type“ of a problem the server writes:
+    // about:blank, or the configured prefix plus “slug“.
+    func lamProblemType(srv *Server, slug string) string {
+        prefix := ""
+        if srv != nil {
+            prefix = srv.ProblemTypePrefix
+        }
+        if prefix == "" || prefix == "about:blank" {
+            return "about:blank"
+        }
+        return prefix + slug
+    }
+
+    // lamServerProblem builds a problem the framework answers with.
+    func lamServerProblem(srv *Server, status int, slug string, detail string) *Problem {
+        if slug == "" {
+            slug = lamProblemSlug(status)
+        }
+        return NewProblem(status, "", detail, lamProblemType(srv, slug), "")
+    }
+
+    // lamProblemsOn: the server answers its own errors with problems.
+    func lamProblemsOn(srv *Server) bool {
+        return srv != nil && srv.ProblemDetails
+    }
+
+    func lamValidationDetail(where string) string {
+        switch where {
+        case "body":
+            return "The request body is not valid."
+        case "querystring", "query":
+            return "The request query string is not valid."
+        case "params":
+            return "The request path parameters are not valid."
+        case "headers":
+            return "The request headers are not valid."
+        case "multipart":
+            return "The request multipart body is not valid."
+        }
+        return "The request " + where + " is not valid."
+    }
+
+    // lamWriteProblem sends the document “doc“ of “p“: status,
+    // application/problem+json, Retry-After / Allow, and the request
+    // path as “instance“ when the document has none.
+    func lamWriteProblem(res *Response, doc LamJSON, p *Problem) {
+        var body interface{} = lamJSONRaw(doc)
+        if raw, ok := body.(map[string]interface{}); ok {
+            if _, has := raw["instance"]; !has {
+                if path, ok := res.Ctx["__lamReqPath"].(string); ok && path != "" {
+                    copied := make(map[string]interface{}, len(raw)+1)
+                    for k, v := range raw {
+                        copied[k] = v
+                    }
+                    copied["instance"] = path
+                    body = copied
+                }
+            }
+        }
+        status := 500
+        if p != nil && p.Status > 0 {
+            status = p.Status
+        }
+        if res.Headers == nil {
+            res.Headers = map[string]string{}
+        }
+        encoded, err := json.Marshal(body)
+        if err != nil {
+            encoded = []byte(fmt.Sprintf(`{"type":"about:blank","title":%q,"status":%d}`, lamProblemTitle(status), status))
+        }
+        res.Status = status
+        res.Headers["Content-Type"] = lamProblemContentType
+        if p != nil && p.RetryAfter > 0 {
+            res.Headers["Retry-After"] = strconv.Itoa(p.RetryAfter)
+        }
+        if p != nil && p.Allow != "" {
+            res.Headers["Allow"] = p.Allow
+        }
+        res.Body = string(encoded)
+        res.Sent = true
+    }
+
+    // lamProblemDocument: “json(p)“ honouring a subclass's
+    // “__json__“. lamc 4.1.3 lowers “json(p)“ of a base-typed value
+    // to the base “__json__“; the instance's dynamic view (bound by
+    // the generated constructors) has the override. Falls back to the
+    // base document when the generated helper is absent.
+    func lamProblemDocument(p *Problem) LamJSON {
+        var target interface{} = p
+        if dyn, ok := target.(interface{ _lamDyn() interface{} }); ok {
+            if actual := dyn._lamDyn(); actual != nil {
+                if m, ok := actual.(lamJSONMarshaler); ok {
+                    return m.LamJSON()
+                }
+            }
+        }
+        return p.LamJSON()
+    }
+
+    // lamSendServerProblem renders a framework problem.
+    func lamSendServerProblem(res *Response, p *Problem) {
+        lamWriteProblem(res, p.LamJSON(), p)
+    }
+
+    // lamExtractProblem finds the Problem of a thrown value: a
+    // *Problem, or an instance of a subclass (which embeds it).
+    func lamExtractProblem(v interface{}) *Problem {
+        if p, ok := v.(*Problem); ok {
+            return p
+        }
+        rv := reflect.ValueOf(v)
+        for depth := 0; depth < 16 && rv.IsValid(); depth++ {
+            if rv.Kind() == reflect.Ptr {
+                if rv.IsNil() {
+                    return nil
+                }
+                rv = rv.Elem()
+            }
+            if rv.Kind() != reflect.Struct {
+                return nil
+            }
+            next := reflect.Value{}
+            for i := 0; i < rv.NumField(); i++ {
+                field := rv.Type().Field(i)
+                if !field.Anonymous || field.PkgPath != "" {
+                    continue
+                }
+                value := rv.Field(i)
+                if p, ok := value.Interface().(*Problem); ok {
+                    return p
+                }
+                if !next.IsValid() && value.Kind() == reflect.Ptr && !value.IsNil() {
+                    next = value
+                }
+            }
+            rv = next
+        }
+        return nil
+    }
+
+    // lamWriteThrownProblem renders a thrown Problem (or subclass
+    // instance) with its own __json__.
+    func lamWriteThrownProblem(res *Response, rec interface{}, p *Problem) {
+        if m, ok := rec.(lamJSONMarshaler); ok {
+            lamWriteProblem(res, m.LamJSON(), p)
+            return
+        }
+        lamWriteProblem(res, p.LamJSON(), p)
+    }
+
     // ─── HttpError surface ─────────────────────────────────
     // The Lam-side “HttpError“ class lowers to a Go struct of the
     // same name. We need a tiny helper to introspect it from inside
     // the dispatcher without a dependency on the generated reflect
     // metadata.
     type lamHttpErrorView struct {
-        Status  int
-        Message string
-        Data    interface{}
+        Status     int
+        Message    string
+        Data       interface{}
+        RetryAfter int
+        Source     *HttpError
     }
 
     // lamExtractHttpError tries to pull a *HttpError out of an
@@ -1610,10 +2132,10 @@ go! {
             return lamHttpErrorView{}, false
         }
         if he, ok := v.(*HttpError); ok && he != nil {
-            return lamHttpErrorView{Status: he.Status, Message: he.Message, Data: he.Data}, true
+            return lamHttpErrorView{Status: he.Status, Message: he.Message, Data: he.Data, RetryAfter: he.RetryAfter, Source: he}, true
         }
         if he, ok := v.(HttpError); ok {
-            return lamHttpErrorView{Status: he.Status, Message: he.Message, Data: he.Data}, true
+            return lamHttpErrorView{Status: he.Status, Message: he.Message, Data: he.Data, RetryAfter: he.RetryAfter, Source: &he}, true
         }
         return lamHttpErrorView{}, false
     }
@@ -2417,6 +2939,96 @@ class Request {
         return contentType.toLower().contains(type_.toLower())
     }
 
+    func acceptedLanguages(self) -> list[str] {
+        #- The language ranges of ``Accept-Language`` in preference order:
+        by q-value (RFC 9110), ties in header order. Ranges with ``q=0``,
+        a malformed q-value or a malformed range are left out; a range
+        repeated (case-insensitively) appears once, at its preferred
+        position. ``*`` is kept. Spelled as in the header; empty when the
+        header is absent. -#
+        out: list[str] = []
+        header: str = self.header("Accept-Language")
+        go! {
+            out = lamAcceptedLanguages(header)
+        }
+        return out
+    }
+
+    func acceptsLanguage(self, supported: list[str], fallback: str = "") -> str {
+        #- The entry of ``supported`` that ``Accept-Language`` prefers, as
+        spelled in ``supported``; ``fallback`` when the header is absent or
+        accepts none of them.
+
+        Ranges are tried by q-value, ties in header order. A range matches
+        the supported tag equal to it (case-insensitively), else the range
+        shortened subtag by subtag (``en-GB`` -> ``en``), else the first
+        supported tag it is a prefix of (``fr`` -> ``fr-CA``). ``*`` takes
+        the first supported tag no other range names. A tag covered by a
+        ``q=0`` range (``en;q=0`` excludes ``en`` and ``en-US``) is never
+        chosen. -#
+        header: str = self.header("Accept-Language")
+        chosen: str = ""
+        go! {
+            chosen = lamNegotiateLanguage(header, supported)
+        }
+        if chosen == "" {
+            return fallback
+        }
+        return chosen
+    }
+
+    func accepts(self, types: list[str], fallback: str = "") -> str {
+        #- The entry of ``types`` (media types such as ``"application/json"``)
+        that ``Accept`` prefers, as spelled in ``types``; ``fallback`` when
+        none is acceptable. Without an ``Accept`` header every type is
+        acceptable and the first one is returned.
+
+        Each type takes the q-value of the most specific matching range
+        (``text/html;level=1`` > ``text/html`` > ``text/*`` > ``*/*``):
+        ``q=0`` makes it unacceptable even when ``*/*`` allows everything.
+        The highest q-value wins; ties go to the more specific range, then
+        the range earlier in the header, then the type earlier in
+        ``types``. Comparison is case-insensitive. -#
+        header: str = self.header("Accept")
+        chosen: str = ""
+        go! {
+            chosen = lamNegotiateMedia(header, types)
+        }
+        if chosen == "" {
+            return fallback
+        }
+        return chosen
+    }
+
+    func routeMeta(self, name: str, fallback: str = "") -> str {
+        #- One entry of the matched route's ``RouteOptions.metadata`` as
+        text: a string as it is, a number or a boolean formatted (``25``,
+        ``1.5``, ``true``). ``fallback`` when the entry is absent, ``None``
+        or another kind of value (lists, dicts), and when no route matched
+        (404s, static files). For guards and generic hooks:
+        ``req.routeMeta("access", "public")``. -#
+        out: str = fallback
+        go! {
+            if route, ok := s.Ctx.Get("__lamMatchedRoute", nil).(*lamRoute); ok && route != nil && route.opts != nil {
+                switch v := route.opts.Meta[name].(type) {
+                case string:
+                    out = v
+                case bool:
+                    out = strconv.FormatBool(v)
+                case int:
+                    out = strconv.Itoa(v)
+                case int64:
+                    out = strconv.FormatInt(v, 10)
+                case float64:
+                    out = strconv.FormatFloat(v, 'f', -1, 64)
+                case float32:
+                    out = strconv.FormatFloat(float64(v), 'f', -1, 32)
+                }
+            }
+        }
+        return out
+    }
+
     func url(self) -> str {
         #- Reconstruct a usable URL for this request as
         ``<scheme>://<host><path>[?query]``. Honours ``trustProxy``
@@ -2730,6 +3342,17 @@ class Response {
             s.Sent = true
             return s
         }
+    }
+
+    func problem(self, p: Problem) -> Response {
+        #- Send ``p`` (RFC 9457): status ``p.status``, ``Content-Type:
+        application/problem+json``, ``Retry-After`` when ``p.retryAfter``
+        is set, ``Allow`` when ``p.allow`` is, and ``json(p)`` as body with
+        the request path as ``instance`` when the document has none. -#
+        go! {
+            lamWriteProblem(s, lamProblemDocument(p), p)
+        }
+        return self
     }
 
     func signedCookie(self, name: str, value: str, secret: str, path: str = "/",
@@ -3063,28 +3686,73 @@ class Response {
 
 class HttpError {
     #- Typed HTTP error: throw ``HttpError`` from a hook or handler to
-    short-circuit with a structured ``application/problem+json``
-    response. Caught by the dispatcher and routed through
-    ``setErrorHandler`` and the ``onError`` chain.
+    short-circuit with a structured response. Caught by the dispatcher
+    after the ``onError`` chain.
 
     ::
 
     if not authed {
-        panic(HttpError.unauthorized("login required"))
+        throw HttpError.unauthorized("login required")
     }
-    panic(HttpError(409, "duplicate", {"key": email}))
+    throw HttpError(409, "duplicate", {"key": email})
 
-    ``data`` is serialised verbatim under the ``data`` key when
-    present — useful for surfacing field-level validation errors. -#
+    By default the response is ``application/json; charset=utf-8``
+    ``{"statusCode", "error", "message", "data"}`` (``data`` verbatim,
+    when present). With ``Server.useProblemDetails`` it is the problem
+    document of ``toProblem``. ``withRetryAfter(seconds)`` adds
+    ``Retry-After`` in both forms. -#
 
     func init(self, status: int, message: str = "", data: any = None) {
         self.status: int = status
         self.message: str = message
         self.data: any = data
+        self.retryAfter: int = 0
     }
 
     func toString(self) -> str {
         return f"HttpError({self.status}): {self.message}"
+    }
+
+    func withRetryAfter(self, seconds: int) -> HttpError {
+        #- Send ``Retry-After: <seconds>`` with the error (0: none). -#
+        self.retryAfter = seconds
+        return self
+    }
+
+    func toProblem(self, typePrefix: str = "about:blank") -> Problem {
+        #- The error as a ``Problem``: its status, the reason phrase as
+        title, ``message`` as detail (left out when empty or equal to the
+        title), ``type`` ``about:blank`` or ``typePrefix`` + the reason
+        phrase as a slug (``"https://example.com/problems/not-found"``),
+        ``retryAfter``. A dict (or JSON object) ``data`` becomes extension
+        members; other ``data`` the ``data`` member. -#
+        p: Problem = Problem(self.status)
+        go! {
+            title := lamProblemTitle(s.Status)
+            p.Title = title
+            if s.Message != "" && s.Message != title && s.Message != http.StatusText(s.Status) {
+                p.Detail = s.Message
+            }
+            prefix := typePrefix
+            if prefix == "" || prefix == "about:blank" {
+                p.Type_ = "about:blank"
+            } else {
+                p.Type_ = prefix + lamProblemSlug(s.Status)
+            }
+            p.RetryAfter = s.RetryAfter
+            if s.Data != nil {
+                if normalized, err := lamJSONNormalize(s.Data, 0); err == nil {
+                    if members, ok := normalized.(map[string]interface{}); ok {
+                        for name, value := range members {
+                            p.Extensions[name] = lamJSONWrapRaw(value)
+                        }
+                    } else {
+                        p.Extensions["data"] = lamJSONWrapRaw(normalized)
+                    }
+                }
+            }
+        }
+        return p
     }
 
     static func badRequest(message: str = "Bad Request", data: any = None) -> HttpError {
@@ -3236,31 +3904,171 @@ class SchemaIssue {
     * ``message`` — the validator's description (the strings
       ``setSchemaErrorFormatter`` receives).
     * ``value`` / ``hasValue`` — the offending value, when there is one
-      (``required`` has none). -#
+      (``required`` has none).
+    * ``part`` — for ``where == "multipart"``, the multipart field whose
+      JSON document failed (``"data"``); ``field`` is then the path inside
+      that document. ``""`` for the other slots. -#
 
-    func init(self, field: str = "", keyword: str = "", message: str = "", value: json = None, hasValue: bool = false) {
+    func init(self, field: str = "", keyword: str = "", message: str = "", value: json = None, hasValue: bool = false, part: str = "") {
         self.field: str = field
         self.keyword: str = keyword
         self.message: str = message
         self.value: json = value
         self.hasValue: bool = hasValue
+        self.part: str = part
     }
 
     func __json__(self) -> json {
-        #- ``{"field", "keyword", "message", "value"}``; ``value`` only
-        when ``hasValue``. -#
+        #- ``{"field", "keyword", "message", "value", "part"}``; ``value``
+        only when ``hasValue``, ``part`` only when set. -#
         out: json = {"field": self.field, "keyword": self.keyword, "message": self.message}
         if self.hasValue {
             out["value"] = self.value
+        }
+        if self.part != "" {
+            out["part"] = self.part
         }
         return out
     }
 
     func __str__(self) -> str {
+        prefix: str = f"{self.part}: " if self.part != "" else ""
         if self.field == "" {
-            return f"{self.keyword}: {self.message}"
+            return f"{prefix}{self.keyword}: {self.message}"
         }
-        return f"{self.field}: {self.keyword}: {self.message}"
+        return f"{prefix}{self.field}: {self.keyword}: {self.message}"
+    }
+}
+
+class Problem {
+    #- An RFC 9457 problem document, sent as ``application/problem+json``
+    by ``Response.problem`` (or thrown: ``throw Problem(409, "", "taken")``).
+
+    * ``status`` — the HTTP status (default 500).
+    * ``title`` — a short summary; ``""`` renders the status reason phrase
+      (``"Not Found"``; ``"Error"`` for unknown codes).
+    * ``detail`` — this occurrence, for people; left out when ``""``.
+    * ``type_`` — a URI naming the problem type (default ``about:blank``).
+    * ``instance`` — the occurrence; ``""`` lets ``res.problem`` use the
+      request path.
+    * ``extensions`` — extra members (``"code"``, ``"balance"``…); they
+      never replace the standard members.
+    * ``errors`` — field problems (``withError`` / ``withIssues``), the
+      ``errors`` member when not empty.
+    * ``retryAfter`` (seconds) and ``allow`` — sent as the ``Retry-After``
+      and ``Allow`` headers, not in the document.
+
+    Subclasses may override ``__json__`` (thrown subclass instances are
+    rendered with it). -#
+
+    func init(self, status: int = 500, title: str = "", detail: str = "", type_: str = "about:blank", instance: str = "") {
+        self.status: int = status
+        self.title: str = title
+        self.detail: str = detail
+        self.type_: str = type_
+        self.instance: str = instance
+        self.extensions: dict[str, json] = {}
+        self.errors: list[json] = []
+        self.retryAfter: int = 0
+        self.allow: str = ""
+    }
+
+    func withExtension(self, name: str, value: json) -> Problem {
+        #- Set the extension member ``name``. -#
+        self.extensions[name] = value
+        return self
+    }
+
+    func withError(self, field: str, message: str, code: str = "") -> Problem {
+        #- Append ``{"field", "message", "code"}`` to ``errors`` (``code``
+        only when given). -#
+        entry: json = {"field": field, "message": message}
+        if code != "" {
+            entry["code"] = code
+        }
+        self.errors.append(entry)
+        return self
+    }
+
+    func withIssues(self, issues: list[SchemaIssue]) -> Problem {
+        #- Append ``json(issue)`` of every schema issue to ``errors``. -#
+        for issue in issues {
+            self.errors.append(json(issue))
+        }
+        return self
+    }
+
+    func withRetryAfter(self, seconds: int) -> Problem {
+        #- Send ``Retry-After: <seconds>`` with the problem (0: none). -#
+        self.retryAfter = seconds
+        return self
+    }
+
+    func withAllow(self, methods: str) -> Problem {
+        #- Send ``Allow: <methods>`` with the problem (a 405). -#
+        self.allow = methods
+        return self
+    }
+
+    func __json__(self) -> json {
+        #- The problem document: ``type``, ``title``, ``status``,
+        ``detail`` / ``instance`` when set, ``errors`` when not empty, and
+        the extensions. -#
+        out: json = {}
+        for name, value in self.extensions {
+            out[name] = value
+        }
+        if len(self.errors) > 0 {
+            out["errors"] = self.errors
+        }
+        title: str = self.title
+        go! {
+            if title == "" {
+                title = lamProblemTitle(s.Status)
+            }
+        }
+        out["type"] = self.type_ if self.type_ != "" else "about:blank"
+        out["title"] = title
+        out["status"] = self.status
+        if self.detail != "" {
+            out["detail"] = self.detail
+        } elif "detail" in self.extensions {
+            del out["detail"]
+        }
+        if self.instance != "" {
+            out["instance"] = self.instance
+        } elif "instance" in self.extensions {
+            del out["instance"]
+        }
+        return out
+    }
+
+    func __str__(self) -> str {
+        title: str = self.title
+        go! {
+            if title == "" {
+                title = lamProblemTitle(s.Status)
+            }
+        }
+        if self.detail == "" {
+            return f"Problem({self.status} {title})"
+        }
+        return f"Problem({self.status} {title}): {self.detail}"
+    }
+
+    static func validation(where: str, issues: list[SchemaIssue], status: int = 400) -> Problem {
+        #- The problem of a schema-validation failure in ``where``
+        (``"body"``, ``"querystring"``, ``"params"``, ``"headers"``,
+        ``"multipart"``): ``detail`` says which part of the request,
+        the ``in`` extension is ``where`` and ``errors`` lists
+        ``json(issue)``. -#
+        detail: str = ""
+        go! {
+            detail = lamValidationDetail(where)
+        }
+        p: Problem = Problem(status, "", detail)
+        p.extensions["in"] = where
+        return p.withIssues(issues)
     }
 }
 
@@ -3276,6 +4084,9 @@ class RouteOptions {
         self.streamBody: bool = streamBody
         self.schemaValue: any = None
         self.schemaFormat: str = "json"
+        # Multipart field -> JSON Schema (normalized object) set with
+        # ``multipartJsonSchema``; merged over the ``multipartJson`` slot.
+        self.multipartJson: dict[str, any] = {}
         self.summary: str = ""
         self.description: str = ""
         self.operationId: str = ""
@@ -3299,8 +4110,9 @@ class RouteOptions {
 
     func withSchema(self, schema: any, format: str = "json") -> RouteOptions {
         #- Attach the Fastify-style schema map: ``body``, ``querystring``
-        (or ``query``), ``params``, ``headers`` and ``response`` (keyed by
-        status). The map and each schema may be a native ``json`` object, a
+        (or ``query``), ``params``, ``headers``, ``response`` (keyed by
+        status) and ``multipartJson`` (keyed by multipart field: see
+        ``multipartJsonSchema``). The map and each schema may be a native ``json`` object, a
         ``dict`` or JSON text (a YAML / XML ``body`` schema is text, with
         ``format`` ``"yaml"`` / ``"xml"``). Anything else — a non-object
         ``json`` value, a number, malformed JSON text — raises
@@ -3318,6 +4130,34 @@ class RouteOptions {
         }
         self.schemaValue = normalized
         self.schemaFormat = format
+        return self
+    }
+
+    func multipartJsonSchema(self, field: str, schema: any) -> RouteOptions {
+        #- Validate the multipart/form-data text field ``field``, decoded as
+        JSON, against ``schema`` (a ``json`` object, a ``dict`` or JSON
+        text; shared ``$ref`` ids resolved like body schemas) before the
+        ``preHandler`` hooks, on multipart requests only: they skip the
+        ``body`` schema, which keeps validating JSON requests. An absent
+        field is a ``required`` issue, malformed JSON a ``parse`` one.
+        Failures are reported with ``where == "multipart"``,
+        ``SchemaIssue.part == field`` and ``SchemaIssue.field`` the path in
+        the document. Same as the ``multipartJson`` slot of ``withSchema``
+        (this method wins for the same field). A field name that is empty or
+        a schema that is not an object raises ``SchemaTypeError`` /
+        ``SchemaParseError``. -#
+        normalized: any = None
+        go! {
+            if strings.TrimSpace(field) == "" {
+                panic("SchemaTypeError: RouteOptions.multipartJsonSchema needs a field name")
+            }
+            obj, err := lamSchemaObject(schema, "RouteOptions.multipartJsonSchema")
+            if err != nil {
+                panic(err.Error())
+            }
+            normalized = obj
+        }
+        self.multipartJson[field] = normalized
         return self
     }
 
@@ -3488,6 +4328,12 @@ class Server {
         # Optional ``func(req: Request, res: Response)`` shaping every
         # ``413 Payload Too Large`` (route ``onPayloadTooLarge`` wins).
         self.payloadTooLargeHandler: any = None
+        # ``useProblemDetails``: the server's own error answers (404,
+        # 405, 408, 413, 500, HttpError, schema validation without a
+        # handler) become RFC 9457 problem documents typed
+        # ``about:blank`` or ``problemTypePrefix`` + slug.
+        self.problemDetails: bool = false
+        self.problemTypePrefix: str = "about:blank"
         # ``onRequestAbort`` hooks fire when the HTTP client
         # disconnects before the handler completed (via
         # ``r.Context().Done()``). Signature:
@@ -4086,6 +4932,30 @@ class Server {
     func clearPayloadTooLargeHandler(self) {
         #- Restore the default 413 response. -#
         self.payloadTooLargeHandler = None
+    }
+
+    func useProblemDetails(self, typePrefix: str = "about:blank") {
+        #- Answer the server's own errors with RFC 9457 problem documents
+        (``application/problem+json``, the request path as ``instance``):
+
+        * ``HttpError`` thrown by hooks and handlers (``toProblem``);
+        * the 404 of an unknown path (without a not-found handler), the 405
+          of a known path (``Allow`` kept), the 413 of a body above the
+          limit (without a payload-too-large handler), the 408 of a request
+          timeout (when the ``onTimeout`` hooks wrote no body), the 400 of
+          an unreadable body and the 500 of an unhandled error (without an
+          error handler; the error as ``detail`` in debug mode only);
+        * schema-validation failures without a schema issue handler or
+          error formatter (``Problem.validation``, status 400).
+
+        ``type`` is ``about:blank``, or ``typePrefix`` followed by the
+        reason phrase as a slug (``https://example.com/problems/`` gives
+        ``https://example.com/problems/not-found``; validation failures are
+        ``validation-failed``). Off by default: the plain-text and JSON
+        answers of earlier versions stay. ``srv.problemDetails = false``
+        turns it off again. -#
+        self.problemDetails = true
+        self.problemTypePrefix = typePrefix if typePrefix != "" else "about:blank"
     }
 
     func onRequestAbort(self, hook: func(Request)) {
@@ -4806,6 +5676,10 @@ class Server {
                         if len(route.opts.Consumes) > 0 {
                             ct = route.opts.Consumes[0]
                         }
+                        if ct == "multipart/form-data" && len(route.opts.MultipartJsonSchemas) > 0 {
+                            // The multipart form is described below.
+                            ct = "application/json"
+                        }
                         var schema interface{}
                         switch format {
                         case "yaml":
@@ -4825,6 +5699,47 @@ class Server {
                             "content": map[string]interface{}{
                                 ct: map[string]interface{}{"schema": schema},
                             },
+                        }
+                    }
+
+                    // Multipart forms whose text fields carry JSON documents
+                    // (``multipartJson``): one property per field, sent
+                    // as application/json parts.
+                    if len(route.opts.MultipartJsonSchemas) > 0 {
+                        fields := make([]string, 0, len(route.opts.MultipartJsonSchemas))
+                        for field := range route.opts.MultipartJsonSchemas {
+                            fields = append(fields, field)
+                        }
+                        slices.Sort(fields)
+                        props := map[string]interface{}{}
+                        encoding := map[string]interface{}{}
+                        required := []interface{}{}
+                        for _, field := range fields {
+                            var schema interface{}
+                            if err := json.Unmarshal([]byte(route.opts.MultipartJsonSchemas[field]), &schema); err != nil || schema == nil {
+                                schema = map[string]interface{}{}
+                            }
+                            props[field] = schema
+                            encoding[field] = map[string]interface{}{"contentType": "application/json"}
+                            required = append(required, field)
+                        }
+                        body, _ := op["requestBody"].(map[string]interface{})
+                        if body == nil {
+                            body = map[string]interface{}{"required": true, "content": map[string]interface{}{}}
+                            op["requestBody"] = body
+                        }
+                        content, _ := body["content"].(map[string]interface{})
+                        if content == nil {
+                            content = map[string]interface{}{}
+                            body["content"] = content
+                        }
+                        content["multipart/form-data"] = map[string]interface{}{
+                            "schema": map[string]interface{}{
+                                "type":       "object",
+                                "required":   required,
+                                "properties": props,
+                            },
+                            "encoding": encoding,
                         }
                     }
 
@@ -5163,7 +6078,14 @@ go! {
     // ─── Validation + serialization helpers ─────────────────
     func lamFailValidation(srv *Server, req *Request, res *Response,
         where string, failure *lamSchemaFailure) {
-        errs := lamSchemaFailureMessages(failure)
+        lamFailValidationIssues(srv, req, res, where, lamBuildSchemaIssues(failure), lamSchemaFailureMessages(failure))
+    }
+
+    // lamFailValidationIssues answers a validation failure: the issue
+    // handler, else the error formatter, else a problem document (with
+    // useProblemDetails), else the default 400 envelope.
+    func lamFailValidationIssues(srv *Server, req *Request, res *Response,
+        where string, issues []*SchemaIssue, errs []string) {
         res.Status = 400
         if res.Headers == nil {
             res.Headers = map[string]string{}
@@ -5174,7 +6096,6 @@ go! {
         // panics is undone and falls through too.
         if srv != nil && srv.SchemaIssueHandler != nil {
             if fn, ok := srv.SchemaIssueHandler.(func(string, []*SchemaIssue, *Request, *Response)); ok {
-                issues := lamBuildSchemaIssues(failure)
                 saved := make(map[string]string, len(res.Headers))
                 for k, v := range res.Headers {
                     saved[k] = v
@@ -5254,6 +6175,13 @@ go! {
             }
         }
 
+        if lamProblemsOn(srv) {
+            p := Problem_validation(where, issues, 400)
+            p.Type_ = lamProblemType(srv, "validation-failed")
+            lamSendServerProblem(res, p)
+            return
+        }
+
         res.Headers["Content-Type"] = "application/json; charset=utf-8"
         payload := map[string]interface{}{
             "statusCode": 400,
@@ -5267,6 +6195,62 @@ go! {
             res.Body = `{"statusCode":400,"error":"Bad Request","message":"validation failed"}`
         }
         res.Sent = true
+    }
+
+    // lamValidateMultipartJson validates the JSON documents of the
+    // multipart text fields named by “schemas“ (fields in name order,
+    // first value of each): an absent field is a “required“ issue,
+    // malformed JSON a “parse“ one; issues carry the field in “Part“.
+    // A schema still referencing a shared id not registered yet is not
+    // checked (as body schemas).
+    func lamValidateMultipartJson(srv *Server, req *Request, res *Response, schemas map[string]string) {
+        issues := []*SchemaIssue{}
+        errs := []string{}
+        ct := lamReadHeader(req, "Content-Type")
+        form, ok := req.Ctx.Get("__lamMultipart", nil).(*lamMultipartForm)
+        if !ok {
+            parsed, err := lamParseMultipart(req.Body, ct)
+            if err != nil {
+                message := "the multipart body is not valid: " + err.Error()
+                issues = append(issues, NewSchemaIssue("", "parse", message, lamJSONWrapRaw(nil), false, ""))
+                lamFailValidationIssues(srv, req, res, "multipart", issues, []string{message})
+                return
+            }
+            req.Ctx.Set("__lamMultipart", parsed)
+            form = parsed
+        }
+        fields := make([]string, 0, len(schemas))
+        for field := range schemas {
+            fields = append(fields, field)
+        }
+        slices.Sort(fields)
+        for _, field := range fields {
+            values := form.Fields[field]
+            if len(values) == 0 {
+                message := fmt.Sprintf("the multipart field %q is required", field)
+                issues = append(issues, NewSchemaIssue("", "required", message, lamJSONWrapRaw(nil), false, field))
+                errs = append(errs, field+": "+message)
+                continue
+            }
+            schemaText := lamResolveSchemaRefs(schemas[field], srv.SharedSchemas)
+            failure := lamSchemaValidateText(schemaText, values[0])
+            if failure != nil && failure.kind == "SchemaCompileError" && lamMissingSharedSchemaRef(schemaText, srv.SharedSchemas) {
+                continue
+            }
+            if failure == nil {
+                continue
+            }
+            for _, issue := range lamBuildSchemaIssues(failure) {
+                issue.Part = field
+                issues = append(issues, issue)
+            }
+            for _, message := range lamSchemaFailureMessages(failure) {
+                errs = append(errs, field+": "+message)
+            }
+        }
+        if len(issues) > 0 {
+            lamFailValidationIssues(srv, req, res, "multipart", issues, errs)
+        }
     }
 
     // lamProjectToSchema walks “val“ against the parsed schema
@@ -5655,7 +6639,11 @@ go! {
         // ── 6. schema validation (route-driven)
         if !res.Sent && matched != nil && matched.opts != nil {
             opts := matched.opts
-            if opts.BodySchema != "" {
+            multipartBody := len(opts.MultipartJsonSchemas) > 0 &&
+                lamContentTypeKey(lamReadHeader(req, "Content-Type")) == "multipart/form-data"
+            if multipartBody {
+                lamValidateMultipartJson(srv, req, res, opts.MultipartJsonSchemas)
+            } else if opts.BodySchema != "" {
                 format := opts.SchemaFormat
                 if format == "" {
                     format = "json"
@@ -5745,34 +6733,24 @@ go! {
                         if fn, ok := srv.NotFoundHandler.(func(*Request, *Response)); ok {
                             callHandler(srv, fn, req, res)
                         } else {
-                            res.Status = 404
-                            res.Body = "404 not found"
-                            res.Sent = true
+                            lamRespondNotFound(srv, req, res)
                         }
                     } else {
-                        res.Status = 404
-                        res.Body = "404 not found"
-                        res.Sent = true
+                        lamRespondNotFound(srv, req, res)
                     }
                 }
             } else if len(pathOnlyMethods) > 0 {
-                res.Status = 405
-                res.Headers["Allow"] = strings.Join(pathOnlyMethods, ", ")
-                res.Headers["Content-Type"] = "text/plain; charset=utf-8"
-                res.Body = "405 method not allowed"
-                res.Sent = true
+                allowed := slices.Clone(pathOnlyMethods)
+                slices.Sort(allowed)
+                lamRespondMethodNotAllowed(srv, req, res, strings.Join(slices.Compact(allowed), ", "))
             } else if srv.NotFoundHandler != nil {
                 if fn, ok := srv.NotFoundHandler.(func(*Request, *Response)); ok {
                     callHandler(srv, fn, req, res)
                 } else {
-                    res.Status = 404
-                    res.Body = "404 not found"
-                    res.Sent = true
+                    lamRespondNotFound(srv, req, res)
                 }
             } else {
-                res.Status = 404
-                res.Body = "404 not found"
-                res.Sent = true
+                lamRespondNotFound(srv, req, res)
             }
         }
 
@@ -5808,6 +6786,34 @@ go! {
         if res.Status == 0 {
             res.Status = 200
         }
+    }
+
+    // lamRespondNotFound: the framework's 404 (no route, no handler).
+    func lamRespondNotFound(srv *Server, req *Request, res *Response) {
+        if lamProblemsOn(srv) {
+            detail := fmt.Sprintf("No route matches %s %s.", req.Method, req.Path)
+            lamSendServerProblem(res, lamServerProblem(srv, 404, "", detail))
+            return
+        }
+        res.Status = 404
+        res.Body = "404 not found"
+        res.Sent = true
+    }
+
+    // lamRespondMethodNotAllowed: the framework's 405 of a known path.
+    func lamRespondMethodNotAllowed(srv *Server, req *Request, res *Response, allow string) {
+        if lamProblemsOn(srv) {
+            detail := fmt.Sprintf("Method %s is not allowed; allowed: %s.", req.Method, allow)
+            p := lamServerProblem(srv, 405, "", detail)
+            p.Allow = allow
+            lamSendServerProblem(res, p)
+            return
+        }
+        res.Status = 405
+        res.Headers["Allow"] = allow
+        res.Headers["Content-Type"] = "text/plain; charset=utf-8"
+        res.Body = "405 method not allowed"
+        res.Sent = true
     }
 
     // lamPickRouteForRequest peeks at the route table to find the
@@ -5888,7 +6894,15 @@ go! {
         }
     }
 
-    func lamDefaultPayloadTooLarge(res *Response) {
+    func lamDefaultPayloadTooLarge(srv *Server, res *Response, route *lamRoute) {
+        if lamProblemsOn(srv) {
+            detail := "The request body is too large."
+            if limit := lamEffectiveBodyLimit(srv, route); limit > 0 {
+                detail = fmt.Sprintf("The request body exceeds the %d byte limit.", limit)
+            }
+            lamSendServerProblem(res, lamServerProblem(srv, 413, "", detail))
+            return
+        }
         res.Status = 413
         if res.Headers == nil {
             res.Headers = map[string]string{}
@@ -5918,7 +6932,7 @@ go! {
     func lamRespondPayloadTooLarge(srv *Server, req *Request, res *Response, route *lamRoute) {
         fn := lamPayloadTooLargeHandler(srv, route)
         if fn == nil {
-            lamDefaultPayloadTooLarge(res)
+            lamDefaultPayloadTooLarge(srv, res, route)
             return
         }
         if res.Headers == nil {
@@ -5945,11 +6959,11 @@ go! {
         }()
         if panicked {
             res.Headers = saved
-            lamDefaultPayloadTooLarge(res)
+            lamDefaultPayloadTooLarge(srv, res, route)
             return
         }
         if !res.Sent {
-            lamDefaultPayloadTooLarge(res)
+            lamDefaultPayloadTooLarge(srv, res, route)
         }
     }
 
@@ -6005,12 +7019,18 @@ go! {
     // we treat as "untouched" here so a fresh timeout response
     // always defaults to 408. Hooks that want a different code
     // (eg 504) just call “res.code(504)“ and we leave it alone.
-    func lamWriteTimeoutResponse(res *Response, timeoutMs int) {
+    func lamWriteTimeoutResponse(srv *Server, res *Response, timeoutMs int) {
         if res.Status == 0 || res.Status == 200 {
             res.Status = 408
         }
         if res.Headers == nil {
             res.Headers = map[string]string{}
+        }
+        if lamProblemsOn(srv) && res.Body == "" {
+            p := lamServerProblem(srv, res.Status, "", fmt.Sprintf("The request handler exceeded the %d ms timeout.", timeoutMs))
+            p.Extensions["timeoutMs"] = lamJSONWrapRaw(timeoutMs)
+            lamSendServerProblem(res, p)
+            return
         }
         if _, set := res.Headers["Content-Type"]; !set {
             res.Headers["Content-Type"] = "application/json; charset=utf-8"
@@ -6084,6 +7104,19 @@ go! {
                 // committed responses.
                 func() {
                     defer func() { _ = recover() }()
+                    if lamProblemsOn(srv) {
+                        detail := ""
+                        if srv.Debug {
+                            detail = fmt.Sprint(rec)
+                        }
+                        fallback := NewResponse()
+                        fallback.Ctx["__lamReqPath"] = r.URL.Path
+                        lamSendServerProblem(fallback, lamServerProblem(srv, 500, "", detail))
+                        w.Header().Set("Content-Type", lamProblemContentType)
+                        w.WriteHeader(500)
+                        io.WriteString(w, fallback.Body)
+                        return
+                    }
                     w.Header().Set("Content-Type", "text/plain; charset=utf-8")
                     w.WriteHeader(500)
                     if srv.Debug {
@@ -6224,10 +7257,15 @@ go! {
                 lamBindMatchedRoute(req, res, peekedRoute, peekedParams)
                 lamRespondPayloadTooLarge(srv, req, res, peekedRoute)
             } else {
-                res.Status = 400
-                res.Headers["Content-Type"] = "text/plain; charset=utf-8"
-                res.Body = "400 bad request"
-                res.Sent = true
+                if lamProblemsOn(srv) {
+                    lamPrepareRequest(srv, req, res)
+                    lamSendServerProblem(res, lamServerProblem(srv, 400, "", "The request body could not be read."))
+                } else {
+                    res.Status = 400
+                    res.Headers["Content-Type"] = "text/plain; charset=utf-8"
+                    res.Body = "400 bad request"
+                    res.Sent = true
+                }
             }
         }
 
@@ -6304,7 +7342,7 @@ go! {
                         // (decorators, schema cache lookups) — the
                         // hooks expect those to be present.
                         lamRunTimeoutHooks(srv, req, timeoutRes)
-                        lamWriteTimeoutResponse(timeoutRes, timeoutMs)
+                        lamWriteTimeoutResponse(srv, timeoutRes, timeoutMs)
                         res = timeoutRes
                     } else {
                         // Client disconnect (the onRequestAbort
@@ -6427,13 +7465,16 @@ go! {
     }
 
     // lamWriteHttpError serialises a typed *HttpError* / HttpError
-    // into the response as “application/problem+json“ with the
-    // status, message and (optional) data slots Fastify users
-    // expect.
+    // into the response as JSON with the status, message and
+    // (optional) data slots Fastify users expect (useProblemDetails:
+    // a problem document instead, see lamHandlePanic).
     func lamWriteHttpError(res *Response, he lamHttpErrorView) {
         res.Status = he.Status
         if res.Headers == nil {
             res.Headers = map[string]string{}
+        }
+        if he.RetryAfter > 0 {
+            res.Headers["Retry-After"] = strconv.Itoa(he.RetryAfter)
         }
         res.Headers["Content-Type"] = "application/json; charset=utf-8"
         msg := he.Message
@@ -6468,6 +7509,12 @@ go! {
         if res.Sent {
             return
         }
+        // A thrown Problem (or subclass instance) is always a problem
+        // document, rendered with its own __json__.
+        if p := lamExtractProblem(rec); p != nil {
+            lamWriteThrownProblem(res, rec, p)
+            return
+        }
         he, isHttpError := lamExtractHttpError(rec)
         // A streamed route's body crossed the limit and the failure
         // escaped the handler (the 413 ``HttpError`` itself, or the
@@ -6483,6 +7530,10 @@ go! {
             }
         }
         if isHttpError {
+            if lamProblemsOn(srv) && he.Source != nil {
+                lamSendServerProblem(res, he.Source.ToProblem(srv.ProblemTypePrefix))
+                return
+            }
             lamWriteHttpError(res, he)
             return
         }
@@ -6496,6 +7547,14 @@ go! {
                     return
                 }
             }
+        }
+        if lamProblemsOn(srv) {
+            detail := ""
+            if srv.Debug {
+                detail = fmt.Sprint(rec)
+            }
+            lamSendServerProblem(res, lamServerProblem(srv, 500, "", detail))
+            return
         }
         res.Status = 500
         if res.Headers == nil {

@@ -2,6 +2,59 @@
 
 All notable changes to `@lam/vulture` are documented here.
 
+## [3.4.0] - 2026-11-04
+
+### Added
+
+- Content negotiation: `req.acceptsLanguage(supported, fallback = "")`
+  returns the supported language `Accept-Language` prefers (RFC 9110
+  q-values, ties in header order, `q=0` excludes, `*`, region fallback
+  `en-GB` -> `en`, prefix match `fr` -> `fr-CA`, case-insensitive, the
+  supported spelling returned); `req.acceptedLanguages()` lists the
+  header's ranges in preference order; `req.accepts(types, fallback = "")`
+  picks the offered media type `Accept` prefers (most specific matching
+  range, `q=0` excludes, ties by specificity then header order; the first
+  type without an `Accept` header).
+- RFC 9457 problem details: `Problem` (`status`, `title`, `detail`,
+  `type_`, `instance`, `extensions`, `errors`, `retryAfter`, `allow`;
+  `withExtension`, `withError`, `withIssues`, `withRetryAfter`,
+  `withAllow`, `json(p)`, `Problem.validation(where, issues, status)`) and
+  `res.problem(p)`, which sends `application/problem+json` with
+  `Retry-After` / `Allow` and the request path as default `instance`.
+  A thrown `Problem` (or subclass instance, its `__json__` honoured) is
+  always sent as a problem document.
+- `srv.useProblemDetails(typePrefix = "about:blank")`: thrown `HttpError`s,
+  the framework's 404 / 405 / 413 / 408 / 400 / 500 answers and
+  schema-validation failures without an issue handler or formatter become
+  problem documents typed `about:blank` or `typePrefix` + slug
+  (`.../not-found`, `.../validation-failed`). Off by default.
+- `HttpError.toProblem(typePrefix)` and `HttpError.withRetryAfter(seconds)`
+  (`Retry-After` also on the default JSON envelope).
+- Multipart JSON validation: the `multipartJson` slot of
+  `RouteOptions.withSchema` (`{"multipartJson": {"data": schema}}`) and
+  `RouteOptions.multipartJsonSchema(field, schema)` validate a multipart
+  text field, decoded as JSON, before the `preHandler` hooks (shared `$ref`
+  fragments resolved, cycles refused at registration); multipart requests
+  skip the `body` schema, other requests keep it. Failures use
+  `where == "multipart"` and the new `SchemaIssue.part` (the field;
+  `json(issue)` has `part` when set); a missing field is `required`,
+  malformed JSON `parse`. `openapi()` describes the fields as a
+  `multipart/form-data` body with `application/json` parts.
+- `req.routeMeta(name, fallback = "")`: one entry of the matched route's
+  metadata as text (strings, numbers, booleans), for guards and hooks.
+
+### Changed
+
+- The `Allow` header of a 405 lists the methods sorted (it followed the
+  router's map order, which varied between runs).
+
+### Documentation
+
+- README: "Content negotiation", "Problem details" and "Route metadata"
+  sections, multipart JSON fields in "Validation", the issue-handler and
+  413 examples use `Problem`; the quick-start and plugin examples compile
+  again (`req.params` value typed, no untyped lambda handler).
+
 ## [3.3.0] - 2026-11-03
 
 ### Added

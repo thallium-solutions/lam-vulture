@@ -1,0 +1,320 @@
+# Test: RFC 9457 problem details.
+#
+# Problem (type_, title, status, detail, instance, extensions, errors,
+# retryAfter, allow) renders as a problem document (json(p)); res.problem(p)
+# sends it as application/problem+json with Retry-After / Allow and the
+# request path as default instance. HttpError keeps its JSON envelope unless
+# srv.useProblemDetails(typePrefix) is on: then HttpError, thrown Problem
+# values, the framework's own 404 / 405 / 413 / 500 / 408 answers and
+# schema-validation failures (without issue handler or formatter) are problem
+# documents; types are about:blank or typePrefix + slug.
+#
+# expect: default-json: {"status":404,"title":"Not Found","type":"about:blank"}
+# expect: full-json: {"code":"duplicate","detail":"The e-mail is taken.","errors":[{"code":"taken","field":"email","message":"already registered"}],"instance":"/users/7","status":409,"title":"Duplicate","type":"https://example.com/problems/duplicate"}
+# expect: ext-no-override: 409 Duplicate
+# expect: unknown-status-title: Error
+# expect: str: Problem(409 Duplicate): The e-mail is taken.
+# expect: validation-static: {"detail":"The request query string is not valid.","errors":[{"field":"page","keyword":"pattern","message":"bad"}],"in":"querystring","status":422,"title":"Unprocessable Content","type":"about:blank"}
+# expect: res-problem: 409 application/problem+json retry=30 allow=[] instance=/conflict
+# expect: res-problem-allow: 405 allow=GET, HEAD
+# expect: res-problem-keeps-instance: /custom
+# expect: http-error-legacy: 418 application/json; charset=utf-8 {"error":"I'm a teapot","message":"i am a teapot","statusCode":418}
+# expect: thrown-problem-legacy: 409 application/problem+json {"detail":"taken","instance":"/throw-problem","status":409,"title":"Conflict","type":"about:blank"}
+# expect: not-found-legacy: 404 404 not found
+# expect: method-legacy: 405 405 method not allowed
+# expect: http-error: 418 application/problem+json {"detail":"i am a teapot","instance":"/teapot","status":418,"title":"I'm a teapot","type":"about:blank"}
+# expect: http-error-data-dict: {"detail":"Invalid order","field":"qty","instance":"/data-dict","status":422,"title":"Unprocessable Content","type":"about:blank"}
+# expect: http-error-data-list: {"data":[1,2],"instance":"/data-list","status":400,"title":"Bad Request","type":"about:blank"}
+# expect: http-error-retry: 429 retry=5 {"detail":"slow down","instance":"/slow","status":429,"title":"Too Many Requests","type":"about:blank"}
+# expect: http-error-to-problem: 404 Not Found about:blank
+# expect: http-error-to-problem-prefix: Unprocessable Content [] urn:p:unprocessable-content
+# expect: not-found: 404 application/problem+json {"detail":"No route matches GET /missing.","instance":"/missing","status":404,"title":"Not Found","type":"about:blank"}
+# expect: method: 405 application/problem+json allow=DELETE, POST detail=Method GET is not allowed; allowed: DELETE, POST.
+# expect: payload: 413 application/problem+json {"detail":"The request body exceeds the 8 byte limit.","instance":"/small","status":413,"title":"Content Too Large","type":"about:blank"}
+# expect: payload-handler-wins: 413 text/plain; charset=utf-8 custom 413
+# expect: panic: 500 application/problem+json {"instance":"/boom","status":500,"title":"Internal Server Error","type":"about:blank"}
+# expect: panic-debug-detail: true
+# expect: error-handler-wins: 503 handled
+# expect: validation: 400 application/problem+json {"detail":"The request body is not valid.","errors":[{"field":"name","keyword":"required","message":"name is required"}],"in":"body","instance":"/orders","status":400,"title":"Bad Request","type":"about:blank"}
+# expect: validation-query: querystring page:pattern
+# expect: issue-handler-wins: 422 text/plain; charset=utf-8 issues=1
+# expect: formatter-wins: 400 application/json; charset=utf-8 {"formatted":true}
+# expect: custom-not-found-untouched: 404 text/plain; charset=utf-8 custom
+# expect: on-send-sees-problem: application/problem+json 404
+# expect: prefix-types: https://example.com/problems/not-found https://example.com/problems/validation-failed https://example.com/problems/im-a-teapot https://example.com/problems/method-not-allowed
+# expect: thrown-problem-keeps-type: urn:x:custom
+# expect: http-404: 404 application/problem+json Not Found
+# expect: http-405: 405 application/problem+json allow=POST
+# expect: http-timeout: 408 application/problem+json Request Timeout 40
+# expect: http-413: 413 application/problem+json Content Too Large
+
+from lamjson import Json
+from @lam/vulture import HttpError, InjectResponse, Problem, Request, Response, RouteOptions, SchemaIssue, Server
+
+func encode(doc: json) -> str {
+    return Json.encode(doc).unwrap()
+}
+
+func ok(_req: Request, _res: Response) -> str {
+    return "ok"
+}
+
+func conflict(_req: Request, res: Response) {
+    p: Problem = Problem(409, "Duplicate", "The e-mail is taken.")
+    _ = res.problem(p.withRetryAfter(30))
+}
+
+func notAllowed(_req: Request, res: Response) {
+    _ = res.problem(Problem(405).withAllow("GET, HEAD"))
+}
+
+func customInstance(_req: Request, res: Response) {
+    _ = res.problem(Problem(400, "", "", "about:blank", "/custom"))
+}
+
+func teapot(_req: Request, _res: Response) {
+    throw HttpError(418, "i am a teapot")
+}
+
+func throwProblem(_req: Request, _res: Response) {
+    throw Problem(409, "", "taken")
+}
+
+func throwTypedProblem(_req: Request, _res: Response) {
+    throw Problem(400, "Custom", "", "urn:x:custom")
+}
+
+func dataDict(_req: Request, _res: Response) {
+    throw HttpError(422, "Invalid order", {"field": "qty"})
+}
+
+func dataList(_req: Request, _res: Response) {
+    throw HttpError(400, "", [1, 2])
+}
+
+func slow(_req: Request, _res: Response) {
+    throw HttpError.tooManyRequests("slow down").withRetryAfter(5)
+}
+
+func boom(_req: Request, _res: Response) {
+    throw "boom"
+}
+
+func sleepy(_req: Request, _res: Response) -> str {
+    go! {
+        time.Sleep(400 * time.Millisecond)
+    }
+    return "late"
+}
+
+func customTooLarge(_req: Request, res: Response) {
+    _ = res.code(413).text("custom 413")
+}
+
+func orderSchema() -> json {
+    return {"body": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}}}
+}
+
+func addRoutes(srv: Server) {
+    srv.get("/conflict", conflict)
+    srv.get("/not-allowed", notAllowed)
+    srv.get("/custom-instance", customInstance)
+    srv.get("/teapot", teapot)
+    srv.get("/throw-problem", throwProblem)
+    srv.get("/typed-problem", throwTypedProblem)
+    srv.get("/data-dict", dataDict)
+    srv.get("/data-list", dataList)
+    srv.get("/slow", slow)
+    srv.get("/boom", boom)
+    srv.post("/items", ok)
+    srv.del("/items", ok)
+    srv.post("/small", ok, RouteOptions(8))
+    srv.post("/small-custom", ok, RouteOptions(8).onPayloadTooLarge(customTooLarge))
+    srv.post("/orders", ok, RouteOptions().withSchema(orderSchema()))
+    srv.get("/search", ok, RouteOptions().withSchema({"querystring": {"type": "object", "properties": {"page": {"type": "string", "pattern": "^[0-9]+$"}}}}))
+    srv.get("/sleepy", sleepy, RouteOptions(0, 40))
+}
+
+func show(r: InjectResponse) -> str {
+    return f"{r.status} {r.header('Content-Type')} {r.body}"
+}
+
+func typeOf(r: InjectResponse) -> str {
+    doc: json = Json.decode(r.body).unwrap()
+    kind: str = doc["type"]
+    return kind
+}
+
+func main() {
+    # ── Problem values
+    print(f"default-json: {encode(json(Problem(404)))}")
+    full: Problem = Problem(409, "Duplicate", "The e-mail is taken.", "https://example.com/problems/duplicate", "/users/7")
+    _ = full.withExtension("code", "duplicate").withError("email", "already registered", "taken").withRetryAfter(30)
+    print(f"full-json: {encode(json(full))}")
+    _ = full.withExtension("status", 999).withExtension("title", "x")
+    doc: json = json(full)
+    status: int = doc["status"]
+    title: str = doc["title"]
+    print(f"ext-no-override: {status} {title}")
+    unknown: json = json(Problem(599))
+    unknownTitle: str = unknown["title"]
+    print(f"unknown-status-title: {unknownTitle}")
+    print(f"str: {Problem(409, 'Duplicate', 'The e-mail is taken.')}")
+    issues: list[SchemaIssue] = [SchemaIssue("page", "pattern", "bad", "x", false)]
+    print(f"validation-static: {encode(json(Problem.validation('querystring', issues, 422)))}")
+
+    # ── res.problem (no server option needed)
+    legacy: Server = Server()
+    addRoutes(legacy)
+    r: InjectResponse = legacy.inject("GET", "/conflict")
+    sent: json = Json.decode(r.body).unwrap()
+    instance: str = sent["instance"]
+    print(f"res-problem: {r.status} {r.header('Content-Type')} retry={r.header('Retry-After')} allow=[{r.header('Allow')}] instance={instance}")
+    r = legacy.inject("GET", "/not-allowed")
+    print(f"res-problem-allow: {r.status} allow={r.header('Allow')}")
+    custom: json = Json.decode(legacy.inject("GET", "/custom-instance").body).unwrap()
+    customPath: str = custom["instance"]
+    print(f"res-problem-keeps-instance: {customPath}")
+
+    # ── Compatibility: the option is off by default
+    print(f"http-error-legacy: {show(legacy.inject('GET', '/teapot'))}")
+    print(f"thrown-problem-legacy: {show(legacy.inject('GET', '/throw-problem'))}")
+    r = legacy.inject("GET", "/missing")
+    print(f"not-found-legacy: {r.status} {r.body}")
+    r = legacy.inject("GET", "/items")
+    print(f"method-legacy: {r.status} {r.body}")
+
+    # ── useProblemDetails
+    srv: Server = Server()
+    srv.useProblemDetails()
+    addRoutes(srv)
+    print(f"http-error: {show(srv.inject('GET', '/teapot'))}")
+    print(f"http-error-data-dict: {srv.inject('GET', '/data-dict').body}")
+    print(f"http-error-data-list: {srv.inject('GET', '/data-list').body}")
+    r = srv.inject("GET", "/slow")
+    print(f"http-error-retry: {r.status} retry={r.header('Retry-After')} {r.body}")
+    converted: Problem = HttpError.notFound().toProblem()
+    print(f"http-error-to-problem: {converted.status} {converted.title} {converted.type_}")
+    prefixedError: Problem = HttpError.unprocessable().toProblem("urn:p:")
+    print(f"http-error-to-problem-prefix: {prefixedError.title} [{prefixedError.detail}] {prefixedError.type_}")
+    print(f"not-found: {show(srv.inject('GET', '/missing'))}")
+    r = srv.inject("GET", "/items")
+    methodDoc: json = Json.decode(r.body).unwrap()
+    methodDetail: str = methodDoc["detail"]
+    print(f"method: {r.status} {r.header('Content-Type')} allow={r.header('Allow')} detail={methodDetail}")
+    print(f"payload: {show(srv.inject('POST', '/small', 'more than eight bytes'))}")
+    print(f"payload-handler-wins: {show(srv.inject('POST', '/small-custom', 'more than eight bytes'))}")
+    print(f"panic: {show(srv.inject('GET', '/boom'))}")
+    srv.debug = true
+    debugDoc: json = Json.decode(srv.inject("GET", "/boom").body).unwrap()
+    debugDetail: str = debugDoc["detail"]
+    print(f"panic-debug-detail: {debugDetail.contains('boom')}")
+    srv.debug = false
+
+    handled: Server = Server()
+    handled.useProblemDetails()
+    addRoutes(handled)
+    func onError(_err: any, _req: Request, res: Response) {
+        _ = res.code(503).text("handled")
+    }
+    handled.setErrorHandler(onError)
+    r = handled.inject("GET", "/boom")
+    print(f"error-handler-wins: {r.status} {r.body}")
+
+    print(f"validation: {show(srv.inject('POST', '/orders', '{}', {'Content-Type': 'application/json'}))}")
+    queryDoc: json = Json.decode(srv.inject("GET", "/search?page=x").body).unwrap()
+    where: str = queryDoc["in"]
+    field: str = queryDoc["errors"][0]["field"]
+    keyword: str = queryDoc["errors"][0]["keyword"]
+    print(f"validation-query: {where} {field}:{keyword}")
+
+    withHandler: Server = Server()
+    withHandler.useProblemDetails()
+    addRoutes(withHandler)
+    func issueHandler(_where: str, found: list[SchemaIssue], _req: Request, res: Response) {
+        _ = res.code(422).text(f"issues={len(found)}")
+    }
+    withHandler.setSchemaIssueHandler(issueHandler)
+    print(f"issue-handler-wins: {show(withHandler.inject('POST', '/orders', '{}', {'Content-Type': 'application/json'}))}")
+
+    withFormatter: Server = Server()
+    withFormatter.useProblemDetails()
+    addRoutes(withFormatter)
+    func formatter(_where: str, _errs: list[str], _req: Request) -> any {
+        return {"formatted": true}
+    }
+    withFormatter.setSchemaErrorFormatter(formatter)
+    print(f"formatter-wins: {show(withFormatter.inject('POST', '/orders', '{}', {'Content-Type': 'application/json'}))}")
+
+    customNotFound: Server = Server()
+    customNotFound.useProblemDetails()
+    func missing(_req: Request, res: Response) {
+        _ = res.code(404).text("custom")
+    }
+    customNotFound.setNotFoundHandler(missing)
+    print(f"custom-not-found-untouched: {show(customNotFound.inject('GET', '/nope'))}")
+
+    observed: list[str] = []
+    func onSend(_req: Request, res: Response) {
+        observed.append(f"{res.getHeader('Content-Type')} {res.status}")
+    }
+    srv.onSend(onSend)
+    _ = srv.inject("GET", "/missing")
+    print(f"on-send-sees-problem: {observed[0]}")
+
+    prefixed: Server = Server()
+    prefixed.useProblemDetails("https://example.com/problems/")
+    addRoutes(prefixed)
+    a: str = typeOf(prefixed.inject("GET", "/missing"))
+    b: str = typeOf(prefixed.inject("POST", "/orders", "{}", {"Content-Type": "application/json"}))
+    c: str = typeOf(prefixed.inject("GET", "/teapot"))
+    d: str = typeOf(prefixed.inject("GET", "/items"))
+    print(f"prefix-types: {a} {b} {c} {d}")
+    print(f"thrown-problem-keeps-type: {typeOf(prefixed.inject('GET', '/typed-problem'))}")
+
+    # ── Over a real listener
+    _ = srv.listenBackground(0).unwrap()
+    address: str = srv.boundAddr
+    lines: list[str] = []
+    go! {
+        get := func(method, path, body string) (*http.Response, map[string]interface{}) {
+            request, _ := http.NewRequest(method, "http://"+address+path, strings.NewReader(body))
+            resp, err := http.DefaultClient.Do(request)
+            if err != nil {
+                return nil, nil
+            }
+            data, _ := io.ReadAll(resp.Body)
+            resp.Body.Close()
+            var doc map[string]interface{}
+            _ = json.Unmarshal(data, &doc)
+            return resp, doc
+        }
+        if resp, doc := get("GET", "/missing", ""); resp != nil {
+            lines = append(lines, fmt.Sprintf("http-404: %d %s %v", resp.StatusCode, resp.Header.Get("Content-Type"), doc["title"]))
+        }
+        if resp, _ := get("PUT", "/small", ""); resp != nil {
+            lines = append(lines, fmt.Sprintf("http-405: %d %s allow=%s", resp.StatusCode, resp.Header.Get("Content-Type"), resp.Header.Get("Allow")))
+        }
+        if resp, doc := get("GET", "/sleepy", ""); resp != nil {
+            lines = append(lines, fmt.Sprintf("http-timeout: %d %s %v %v", resp.StatusCode, resp.Header.Get("Content-Type"), doc["title"], doc["timeoutMs"]))
+        }
+        if resp, doc := get("POST", "/small", "more than eight bytes"); resp != nil {
+            lines = append(lines, fmt.Sprintf("http-413: %d %s %v", resp.StatusCode, resp.Header.Get("Content-Type"), doc["title"]))
+        }
+    }
+    srv.close()
+    for line in lines {
+        print(line)
+    }
+}
+
+go! {
+    import (
+        "encoding/json"
+        "fmt"
+        "io"
+        "net/http"
+        "strings"
+        "time"
+    )
+}

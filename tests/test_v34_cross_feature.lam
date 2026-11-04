@@ -1,0 +1,336 @@
+# Test: 3.4 features composed in one application.
+#
+# An API plugin (encapsulated, prefixed) whose guard reads the route
+# metadata (req.routeMeta) and throws a Problem subclass localized with
+# req.acceptsLanguage; a multipart upload whose JSON part is validated by
+# multipartJson schemas with shared $refs, the issues answered by a schema
+# issue handler building Problem.validation(...) with res.problem; media
+# negotiation with req.accepts (406 as a problem with an extension); the
+# server's useProblemDetails covering 404 / 405 / 413 / HttpError with a type
+# prefix. Exercises classes with inheritance and __json__ overrides, nested
+# functions, lambdas, comprehensions, match, dict lookups and Result.
+#
+# expect: unauthenticated-en: 401 application/problem+json https://shop.example/problems/unauthenticated Sign in first. code=unauthenticated lang=en
+# expect: unauthenticated-it: 401 Accedi prima. lang=it
+# expect: unauthenticated-region: 401 Accedi prima. lang=it
+# expect: list-json: 200 application/json [{"name":"Bag","price":12.5}]
+# expect: list-csv: 200 text/csv name,price|Bag,12.5
+# expect: list-406: 406 application/problem+json accepted=application/json,text/csv
+# expect: upload-ok: 201 created Bag 2 photos
+# expect: upload-invalid-it: 422 validation-failed Dati non validi. multipart data:price:minimum data:sku:pattern
+# expect: upload-invalid-en: 422 Invalid data. multipart
+# expect: upload-missing-part: 422 multipart data::required
+# expect: upload-json-body: 422 body :price:minimum
+# expect: not-found: 404 https://shop.example/problems/not-found
+# expect: method: 405 https://shop.example/problems/method-not-allowed GET, POST
+# expect: too-large: 413 https://shop.example/problems/content-too-large
+# expect: http-error: 409 https://shop.example/problems/conflict sku=B-1
+# expect: public-route-no-guard: 200 en,it
+# expect: res-problem-subclass: 409 application/problem+json code=conflict lang=it Esiste già. /api/duplicate
+# expect: summary: 17 cases, 17 problems-or-ok
+# expect: http-upload: 422 application/problem+json data:price:minimum
+# expect: http-guard: 401 Sign in first.
+
+from lamjson import Json
+from lamerrors import Result
+from @lam/vulture import HttpError, InjectResponse, Problem, Request, Response, RouteOptions, SchemaIssue, Server
+
+const Boundary: str = "ShopBoundary"
+const Languages: list[str] = ["en", "it"]
+const Messages: dict[str, dict[str, str]] = {
+    "en": {"unauthenticated": "Sign in first.", "validation-failed": "Invalid data.", "conflict": "Already exists."},
+    "it": {"unauthenticated": "Accedi prima.", "validation-failed": "Dati non validi.", "conflict": "Esiste già."},
+}
+
+class ApiProblem(Problem) {
+    func init(self, status: int, code: str, lang: str) {
+        base.init(status, "", Messages[lang][code], f"https://shop.example/problems/{code}")
+        self.code: str = code
+        self.lang: str = lang
+    }
+
+    func __json__(self) -> json {
+        kind: str = self.type_
+        title: str = self.title
+        status: int = self.status
+        detail: str = self.detail
+        instance: str = self.instance
+        errors: list[json] = self.errors
+        doc: json = {"type": kind, "title": title, "status": status, "detail": detail, "code": self.code, "lang": self.lang}
+        if instance != "" {
+            doc["instance"] = instance
+        }
+        if len(errors) > 0 {
+            doc["errors"] = errors
+        }
+        return doc
+    }
+}
+
+class Product {
+    func init(self, name: str, price: float) {
+        self.name: str = name
+        self.price: float = price
+    }
+
+    func __json__(self) -> json {
+        return {"name": self.name, "price": self.price}
+    }
+}
+
+func langOf(req: Request) -> str {
+    return req.acceptsLanguage(Languages, "en")
+}
+
+func guard(req: Request, _res: Response) {
+    if req.routeMeta("access", "public") == "user" and req.header("Authorization") == "" {
+        throw ApiProblem(401, "unauthenticated", langOf(req))
+    }
+}
+
+func listProducts(req: Request, res: Response) {
+    products: list[Product] = [Product("Bag", 12.5)]
+    match req.accepts(["application/json", "text/csv"]) {
+        case "application/json" {
+            _ = res.json([json(p) for p in products])
+        }
+        case "text/csv" {
+            rows: list[str] = ["name,price"] + [f"{p.name},{p.price}" for p in products]
+            _ = res.type_("text/csv").send("\n".join(rows))
+        }
+        case _ {
+            _ = res.problem(Problem(406).withExtension("accepted", ["application/json", "text/csv"]))
+        }
+    }
+}
+
+func upload(req: Request, res: Response) -> str {
+    parsed: Result[json] = Json.decode(req.formField("data"))
+    name: str = parsed.unwrap()["name"] if parsed.ok() else "?"
+    _ = res.code(201)
+    return f"created {name} {len(req.formFiles('photo'))} photos"
+}
+
+func conflict(_req: Request, _res: Response) {
+    throw HttpError.conflict("duplicate sku", {"sku": "B-1"})
+}
+
+func duplicate(req: Request, res: Response) {
+    _ = res.problem(ApiProblem(409, "conflict", langOf(req)))
+}
+
+func listLanguages(req: Request, _res: Response) -> str {
+    return ",".join(req.acceptedLanguages())
+}
+
+func issues(where: str, found: list[SchemaIssue], req: Request, res: Response) {
+    lang: str = langOf(req)
+    p: Problem = Problem.validation(where, found, 422)
+    p.type_ = "https://shop.example/problems/validation-failed"
+    p.detail = Messages[lang]["validation-failed"]
+    _ = res.problem(p)
+}
+
+func productSchema() -> json {
+    return {
+        "type": "object",
+        "required": ["name", "price"],
+        "properties": {"name": {"type": "string"}, "price": {"$ref": "money"}, "sku": {"$ref": "sku"}},
+    }
+}
+
+func api(app: Server) {
+    app.preHandler(guard)
+    app.get("/products", listProducts, RouteOptions().metadata("access", "public"))
+    uploadOptions: RouteOptions = RouteOptions(4096).metadata("access", "user")
+    _ = uploadOptions.withSchema({"body": productSchema(), "multipartJson": {"data": productSchema()}})
+    app.post("/products", upload, uploadOptions)
+    app.post("/conflict", conflict, RouteOptions().metadata("access", "user"))
+    app.get("/languages", listLanguages)
+    app.put("/duplicate", duplicate)
+}
+
+func makeServer() -> Server {
+    srv: Server = Server()
+    srv.useProblemDetails("https://shop.example/problems/")
+    srv.addSchema({"$id": "money", "type": "number", "minimum": 0})
+    srv.addSchema({"$id": "sku", "type": "string", "pattern": "^[A-Z]-[0-9]+$"})
+    srv.setSchemaIssueHandler(issues)
+    srv.register(api, "/api", true)
+    return srv
+}
+
+func part(name: str, value: str, filename: str = "") -> str {
+    disposition: str = f"form-data; name=\"{name}\"" + (f"; filename=\"{filename}\"" if filename != "" else "")
+    return f"--{Boundary}\r\nContent-Disposition: {disposition}\r\n\r\n{value}\r\n"
+}
+
+func form(parts: list[str]) -> str {
+    return "".join(parts) + f"--{Boundary}--\r\n"
+}
+
+func docOf(r: InjectResponse) -> json {
+    return Json.decode(r.body).unwrap()
+}
+
+func issueList(doc: json) -> str {
+    out: list[str] = []
+    for i in range(len(doc["errors"])) {
+        entry: json = doc["errors"][i]
+        partName: str = entry["part"] ?? ""
+        field: str = entry["field"]
+        keyword: str = entry["keyword"]
+        out.append(f"{partName}:{field}:{keyword}")
+    }
+    return " ".join(out)
+}
+
+func main() {
+    srv: Server = makeServer()
+    auth: dict[str, str] = {"Authorization": "Bearer t", "Content-Type": f"multipart/form-data; boundary={Boundary}"}
+    withLang: func(str) -> dict[str, str] = lambda(lang: str) -> dict[str, str] {
+        return {"Authorization": "Bearer t", "Content-Type": f"multipart/form-data; boundary={Boundary}", "Accept-Language": lang}
+    }
+    statuses: list[int] = []
+    func run(method: str, path: str, body: str, headers: dict[str, str]) -> InjectResponse {
+        r: InjectResponse = srv.inject(method, path, body, headers)
+        statuses.append(r.status)
+        return r
+    }
+
+    r: InjectResponse = run("POST", "/api/conflict", "", {})
+    doc: json = docOf(r)
+    kind: str = doc["type"]
+    detail: str = doc["detail"]
+    code: str = doc["code"]
+    lang: str = doc["lang"]
+    print(f"unauthenticated-en: {r.status} {r.header('Content-Type')} {kind} {detail} code={code} lang={lang}")
+    r = run("POST", "/api/conflict", "", {"Accept-Language": "it, en;q=0.5"})
+    doc = docOf(r)
+    detail = doc["detail"]
+    lang = doc["lang"]
+    print(f"unauthenticated-it: {r.status} {detail} lang={lang}")
+    r = run("POST", "/api/conflict", "", {"Accept-Language": "de-DE, it-CH;q=0.9"})
+    doc = docOf(r)
+    detail = doc["detail"]
+    lang = doc["lang"]
+    print(f"unauthenticated-region: {r.status} {detail} lang={lang}")
+
+    r = run("GET", "/api/products", "", {"Accept": "application/json"})
+    print(f"list-json: {r.status} {r.header('Content-Type')} {r.body}")
+    r = run("GET", "/api/products", "", {"Accept": "text/csv, application/json;q=0.5"})
+    csv: str = r.body.replace("\n", "|")
+    print(f"list-csv: {r.status} {r.header('Content-Type')} {csv}")
+    r = run("GET", "/api/products", "", {"Accept": "image/*"})
+    offeredTypes: json = docOf(r)["accepted"]
+    accepted: list[str] = []
+    for i in range(len(offeredTypes)) {
+        offeredType: str = offeredTypes[i]
+        accepted.append(offeredType)
+    }
+    print(f"list-406: {r.status} {r.header('Content-Type')} accepted={','.join(accepted)}")
+
+    good: str = form([part("data", "{\"name\": \"Bag\", \"price\": 3, \"sku\": \"B-1\"}"), part("photo", "P1", "a.png"), part("photo", "P2", "b.png")])
+    r = run("POST", "/api/products", good, auth)
+    print(f"upload-ok: {r.status} {r.body}")
+    bad: str = form([part("data", "{\"name\": \"Bag\", \"price\": -1, \"sku\": \"bad\"}")])
+    r = run("POST", "/api/products", bad, withLang("it"))
+    doc = docOf(r)
+    kind = doc["type"]
+    detail = doc["detail"]
+    where: str = doc["in"]
+    print(f"upload-invalid-it: {r.status} {kind.split('/')[-1]} {detail} {where} {issueList(doc)}")
+    r = run("POST", "/api/products", bad, withLang("en-US"))
+    doc = docOf(r)
+    detail = doc["detail"]
+    where = doc["in"]
+    print(f"upload-invalid-en: {r.status} {detail} {where}")
+    r = run("POST", "/api/products", form([part("other", "x")]), auth)
+    doc = docOf(r)
+    where = doc["in"]
+    print(f"upload-missing-part: {r.status} {where} {issueList(doc)}")
+    r = run("POST", "/api/products", "{\"name\": \"Bag\", \"price\": -5}", {"Authorization": "Bearer t", "Content-Type": "application/json"})
+    doc = docOf(r)
+    where = doc["in"]
+    print(f"upload-json-body: {r.status} {where} {issueList(doc)}")
+
+    types: dict[str, str] = {}
+    func typeFor(label: str, res: InjectResponse) {
+        types[label] = docOf(res)["type"]
+    }
+    r = run("GET", "/api/nothing", "", {})
+    typeFor("404", r)
+    print(f"not-found: {r.status} {types['404']}")
+    r = run("DELETE", "/api/products", "", {})
+    typeFor("405", r)
+    print(f"method: {r.status} {types['405']} {r.header('Allow')}")
+    r = run("POST", "/api/products", "x" * 5000, auth)
+    typeFor("413", r)
+    print(f"too-large: {r.status} {types['413']}")
+    r = run("POST", "/api/conflict", "", {"Authorization": "Bearer t"})
+    typeFor("409", r)
+    sku: str = docOf(r)["sku"]
+    print(f"http-error: {r.status} {types['409']} sku={sku}")
+    r = run("GET", "/api/languages", "", {"Accept-Language": "it;q=0.5, en"})
+    print(f"public-route-no-guard: {r.status} {r.body}")
+
+    r = run("PUT", "/api/duplicate", "", {"Accept-Language": "it-IT"})
+    doc = docOf(r)
+    code = doc["code"]
+    lang = doc["lang"]
+    detail = doc["detail"]
+    instancePath: str = doc["instance"]
+    print(f"res-problem-subclass: {r.status} {r.header('Content-Type')} code={code} lang={lang} {detail} {instancePath}")
+
+    known: list[int] = [s for s in statuses if s in [200, 201, 401, 404, 405, 406, 409, 413, 422]]
+    print(f"summary: {len(statuses)} cases, {len(known)} problems-or-ok")
+
+    _ = srv.listenBackground(0).unwrap()
+    address: str = srv.boundAddr
+    lines: list[str] = []
+    go! {
+        var buf bytes.Buffer
+        w := multipart.NewWriter(&buf)
+        _ = w.WriteField("data", `{"name": "Bag", "price": -9}`)
+        w.Close()
+        request, _ := http.NewRequest("POST", "http://"+address+"/api/products", &buf)
+        request.Header.Set("Content-Type", w.FormDataContentType())
+        request.Header.Set("Authorization", "Bearer t")
+        if resp, err := http.DefaultClient.Do(request); err == nil {
+            data, _ := io.ReadAll(resp.Body)
+            resp.Body.Close()
+            var doc map[string]interface{}
+            _ = json.Unmarshal(data, &doc)
+            first := ""
+            if errs, ok := doc["errors"].([]interface{}); ok && len(errs) > 0 {
+                if e, ok := errs[0].(map[string]interface{}); ok {
+                    first = fmt.Sprintf("%v:%v:%v", e["part"], e["field"], e["keyword"])
+                }
+            }
+            lines = append(lines, fmt.Sprintf("http-upload: %d %s %s", resp.StatusCode, resp.Header.Get("Content-Type"), first))
+        }
+        if resp, err := http.Post("http://"+address+"/api/conflict", "application/json", strings.NewReader("")); err == nil {
+            data, _ := io.ReadAll(resp.Body)
+            resp.Body.Close()
+            var doc map[string]interface{}
+            _ = json.Unmarshal(data, &doc)
+            lines = append(lines, fmt.Sprintf("http-guard: %d %v", resp.StatusCode, doc["detail"]))
+        }
+    }
+    srv.close()
+    for line in lines {
+        print(line)
+    }
+}
+
+go! {
+    import (
+        "bytes"
+        "encoding/json"
+        "fmt"
+        "io"
+        "mime/multipart"
+        "net/http"
+        "strings"
+    )
+}

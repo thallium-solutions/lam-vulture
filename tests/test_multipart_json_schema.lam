@@ -1,0 +1,286 @@
+# Test: JSON Schema validation of the JSON text fields of multipart uploads.
+#
+# RouteOptions.withSchema({"multipartJson": {"data": schema}}) and
+# RouteOptions.multipartJsonSchema(field, schema) validate the named
+# multipart/form-data text field, decoded as JSON, before the preHandler
+# hooks (shared $ref fragments resolved like body schemas). Failures go
+# through the same path as the other slots with where = "multipart":
+# SchemaIssue.field is the path inside the JSON document, SchemaIssue.part
+# the multipart field. A missing field is `required`, malformed JSON
+# `parse`. Requests that are not multipart keep the body schema.
+#
+# expect: valid: 200 Bag 12.5 photo=a.png
+# expect: invalid: 400 multipart data/price:minimum
+# expect: missing: multipart data/:required
+# expect: malformed: multipart data/:parse
+# expect: shared-ref: multipart data/owner:pattern
+# expect: nested-ref: multipart data/tags.1:maxLength
+# expect: json-body-uses-body-schema: body /price:minimum
+# expect: json-body-valid: 200
+# expect: no-multipart-schema-unchanged: body /:parse
+# expect: two-fields: multipart data/name:required data/price:required meta/:type
+# expect: method-form: 400 multipart data/name:required
+# expect: method-form-valid: 200
+# expect: repeated-first-value: 200
+# expect: issue-json: {"field":"price","keyword":"minimum","message":"Must be greater than or equal to 0","part":"data","value":-1}
+# expect: issue-str: data: price: minimum: Must be greater than or equal to 0
+# expect: default-envelope: 400 validation failed: multipart ["data: Must be greater than or equal to 0"]
+# expect: formatter: multipart data: name is required
+# expect: problem: 400 application/problem+json multipart The request multipart body is not valid. data price minimum
+# expect: late-shared-schema: 400 multipart data/owner:pattern
+# expect: stream-body: 400 multipart data/price:minimum
+# expect: stream-body-valid: 200 ok
+# expect: bad-schema: SchemaTypeError
+# expect: bad-slot: SchemaTypeError
+# expect: bad-field-name: SchemaTypeError
+# expect: cycle: SchemaRefCycleError
+# expect: openapi: application/json multipart/form-data data application/json minLength=1
+# expect: http: 400 multipart data/price:minimum
+# expect: http-valid: 200 Bag 3 photo=b.png
+
+from lamjson import Json
+from lamerrors import Result
+from @lam/vulture import InjectResponse, Request, Response, RouteOptions, SchemaIssue, Server
+
+const Boundary: str = "LamVultureBoundary"
+
+func textPart(name: str, value: str) -> str {
+    return f"--{Boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+}
+
+func filePart(name: str, filename: str, content: str) -> str {
+    return f"--{Boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: image/png\r\n\r\n{content}\r\n"
+}
+
+func closing() -> str {
+    return f"--{Boundary}--\r\n"
+}
+
+func multipartHeaders() -> dict[str, str] {
+    return {"Content-Type": f"multipart/form-data; boundary={Boundary}"}
+}
+
+func productSchema() -> json {
+    return {
+        "type": "object",
+        "required": ["name", "price"],
+        "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "price": {"$ref": "money"},
+            "owner": {"$ref": "uuid"},
+            "tags": {"type": "array", "items": {"$ref": "tag"}},
+        },
+    }
+}
+
+func create(req: Request, _res: Response) -> str {
+    data: json = Json.decode(req.formField("data", "{}")).unwrap()
+    name: str = data["name"] ?? ""
+    price: float = data["price"] ?? 0.0
+    photo: str = ""
+    file: any = req.formFile("photo")
+    if isinstance(file, dict) {
+        photo = str(file["filename"])
+    }
+    return f"{name} {price} photo={photo}"
+}
+
+func ok(_req: Request, _res: Response) -> str {
+    return "ok"
+}
+
+func describe(issue: SchemaIssue) -> str {
+    return f"{issue.part}/{issue.field}:{issue.keyword}"
+}
+
+func record(where: str, issues: list[SchemaIssue], _req: Request, res: Response) {
+    parts: list[str] = [describe(issue) for issue in issues]
+    _ = res.code(400).text(f"{where} {' '.join(parts)}")
+}
+
+func readBody(req: Request, _res: Response) {
+    if req.streamBody {
+        read: Result[str] = req.bodyReader().readAll()
+        if read.ok() {
+            req.body = read.unwrap()
+        }
+    }
+}
+
+func addShared(srv: Server) {
+    srv.addSchema({"$id": "money", "type": "number", "minimum": 0})
+    srv.addSchema({"$id": "uuid", "type": "string", "pattern": "^[0-9a-f-]{36}$"})
+    srv.addSchema({"$id": "tag", "type": "string", "maxLength": 5})
+}
+
+func makeServer() -> Server {
+    srv: Server = Server()
+    addShared(srv)
+    srv.post("/products", create, RouteOptions().withSchema({"body": productSchema(), "multipartJson": {"data": productSchema()}}))
+    srv.post("/plain", create, RouteOptions().withSchema({"body": productSchema()}))
+    two: json = {"multipartJson": {"data": productSchema(), "meta": {"type": "object"}}}
+    srv.post("/two", create, RouteOptions().withSchema(two))
+    srv.post("/method", create, RouteOptions().multipartJsonSchema("data", productSchema()))
+    stream: RouteOptions = RouteOptions(0, 0, true).multipartJsonSchema("data", productSchema())
+    srv.post("/stream", ok, stream.preValidation(readBody))
+    return srv
+}
+
+func expectError(label: str, action: func()) {
+    try {
+        action()
+        print(f"{label}: no error")
+    } catch err {
+        text: str = str(err)
+        print(f"{label}: {text.split(':')[0]}")
+    }
+}
+
+func main() {
+    srv: Server = makeServer()
+    srv.setSchemaIssueHandler(record)
+    headers: dict[str, str] = multipartHeaders()
+    func send(path: str, body: str) -> InjectResponse {
+        return srv.inject("POST", path, body, headers)
+    }
+
+    valid: str = textPart("data", "{\"name\": \"Bag\", \"price\": 12.5}") + filePart("photo", "a.png", "PNG") + closing()
+    r: InjectResponse = send("/products", valid)
+    print(f"valid: {r.status} {r.body}")
+    r = send("/products", textPart("data", "{\"name\": \"Bag\", \"price\": -1}") + closing())
+    print(f"invalid: {r.status} {r.body}")
+    print(f"missing: {send('/products', textPart('other', 'x') + closing()).body}")
+    print(f"malformed: {send('/products', textPart('data', '{name') + closing()).body}")
+    owner: str = "{\"name\": \"Bag\", \"price\": 1, \"owner\": \"nope\"}"
+    print(f"shared-ref: {send('/products', textPart('data', owner) + closing()).body}")
+    tags: str = "{\"name\": \"Bag\", \"price\": 1, \"tags\": [\"ok\", \"too-long\"]}"
+    print(f"nested-ref: {send('/products', textPart('data', tags) + closing()).body}")
+    jsonHeaders: dict[str, str] = {"Content-Type": "application/json"}
+    r = srv.inject("POST", "/products", "{\"name\": \"Bag\", \"price\": -3}", jsonHeaders)
+    print(f"json-body-uses-body-schema: {r.body}")
+    r = srv.inject("POST", "/products", "{\"name\": \"Bag\", \"price\": 3}", jsonHeaders)
+    print(f"json-body-valid: {r.status}")
+    print(f"no-multipart-schema-unchanged: {send('/plain', valid).body}")
+    print(f"two-fields: {send('/two', textPart('data', '{}') + textPart('meta', '[1]') + closing()).body}")
+    r = send("/method", textPart("data", "{\"price\": 1}") + closing())
+    print(f"method-form: {r.status} {r.body}")
+    print(f"method-form-valid: {send('/method', valid).status}")
+    repeated: str = textPart("data", "{\"name\": \"A\", \"price\": 1}") + textPart("data", "{}") + closing()
+    print(f"repeated-first-value: {send('/products', repeated).status}")
+
+    captured: list[SchemaIssue] = []
+    probe: Server = makeServer()
+    func capture(_where: str, issues: list[SchemaIssue], _req: Request, res: Response) {
+        for issue in issues {
+            captured.append(issue)
+        }
+        _ = res.code(400).text("captured")
+    }
+    probe.setSchemaIssueHandler(capture)
+    _ = probe.inject("POST", "/products", textPart("data", "{\"name\": \"Bag\", \"price\": -1}") + closing(), headers)
+    print(f"issue-json: {Json.encode(json(captured[0])).unwrap()}")
+    print(f"issue-str: {captured[0]}")
+
+    plain: Server = makeServer()
+    r = plain.inject("POST", "/products", textPart("data", "{\"name\": \"Bag\", \"price\": -1}") + closing(), headers)
+    envelope: json = Json.decode(r.body).unwrap()
+    message: str = envelope["message"]
+    print(f"default-envelope: {r.status} {message} {Json.encode(envelope['validation']).unwrap()}")
+
+    formatted: Server = makeServer()
+    func formatter(where: str, errs: list[str], _req: Request) -> any {
+        return f"{where} {' | '.join(errs)}"
+    }
+    formatted.setSchemaErrorFormatter(formatter)
+    print(f"formatter: {formatted.inject('POST', '/products', textPart('data', '{\"price\": 1}') + closing(), headers).body}")
+
+    problems: Server = makeServer()
+    problems.useProblemDetails()
+    r = problems.inject("POST", "/products", textPart("data", "{\"name\": \"Bag\", \"price\": -1}") + closing(), headers)
+    doc: json = Json.decode(r.body).unwrap()
+    where: str = doc["in"]
+    detail: str = doc["detail"]
+    part: str = doc["errors"][0]["part"]
+    field: str = doc["errors"][0]["field"]
+    keyword: str = doc["errors"][0]["keyword"]
+    print(f"problem: {r.status} {r.header('Content-Type')} {where} {detail} {part} {field} {keyword}")
+
+    late: Server = Server()
+    late.setSchemaIssueHandler(record)
+    late.post("/late", ok, RouteOptions().multipartJsonSchema("data", {"type": "object", "properties": {"owner": {"$ref": "uuid"}}}))
+    late.addSchema({"$id": "uuid", "type": "string", "pattern": "^[0-9a-f-]{36}$"})
+    r = late.inject("POST", "/late", textPart("data", "{\"owner\": \"x\"}") + closing(), headers)
+    print(f"late-shared-schema: {r.status} {r.body}")
+
+    r = send("/stream", textPart("data", "{\"name\": \"Bag\", \"price\": -1}") + closing())
+    print(f"stream-body: {r.status} {r.body}")
+    r = send("/stream", valid)
+    print(f"stream-body-valid: {r.status} {r.body}")
+
+    func badSchema() {
+        _ = RouteOptions().multipartJsonSchema("data", 42)
+    }
+    expectError("bad-schema", badSchema)
+    func badSlot() {
+        _ = RouteOptions().withSchema({"multipartJson": ["data"]})
+    }
+    expectError("bad-slot", badSlot)
+    func badField() {
+        _ = RouteOptions().multipartJsonSchema("", {"type": "object"})
+    }
+    expectError("bad-field-name", badField)
+    cyclic: Server = Server()
+    cyclic.sharedSchemas["a"] = "{\"$id\": \"a\", \"items\": {\"$ref\": \"a\"}}"
+    func cycle() {
+        cyclic.post("/c", ok, RouteOptions().multipartJsonSchema("data", {"$ref": "a"}))
+    }
+    expectError("cycle", cycle)
+
+    spec: json = Json.decode(srv.openapi()).unwrap()
+    content: json = spec["paths"]["/products"]["post"]["requestBody"]["content"]
+    keys: list[str] = [key for key in Json.toDict(content).unwrap()]
+    form: json = content["multipart/form-data"]
+    required: str = form["schema"]["required"][0]
+    encoding: str = form["encoding"]["data"]["contentType"]
+    minLength: int = form["schema"]["properties"]["data"]["properties"]["name"]["minLength"]
+    print(f"openapi: {' '.join(keys.sort())} {required} {encoding} minLength={minLength}")
+
+    _ = srv.listenBackground(0).unwrap()
+    address: str = srv.boundAddr
+    lines: list[str] = []
+    go! {
+        post := func(data string, file string) string {
+            var buf bytes.Buffer
+            w := multipart.NewWriter(&buf)
+            _ = w.WriteField("data", data)
+            if file != "" {
+                fw, _ := w.CreateFormFile("photo", file)
+                _, _ = fw.Write([]byte("PNG"))
+            }
+            w.Close()
+            resp, err := http.Post("http://"+address+"/products", w.FormDataContentType(), &buf)
+            if err != nil {
+                return err.Error()
+            }
+            body, _ := io.ReadAll(resp.Body)
+            resp.Body.Close()
+            return fmt.Sprintf("%d %s", resp.StatusCode, string(body))
+        }
+        lines = append(lines, "http: "+post(`{"name": "Bag", "price": -2}`, ""))
+        lines = append(lines, "http-valid: "+post(`{"name": "Bag", "price": 3}`, "b.png"))
+    }
+    srv.close()
+    for line in lines {
+        print(line)
+    }
+}
+
+go! {
+    import (
+        "bytes"
+        "fmt"
+        "io"
+        "mime/multipart"
+        "net/http"
+    )
+}

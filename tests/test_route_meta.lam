@@ -1,0 +1,151 @@
+# Test: req.routeMeta(name, fallback) reads one entry of the matched route's
+# RouteOptions.metadata as text: strings as they are, numbers and booleans
+# formatted, absent / None / other values give the fallback; requests that
+# matched no route (404, static mounts) and bare routes have no metadata.
+# Guards in hooks use it (preHandler deciding from the route's "access"),
+# the 413 handler sees it, encapsulated plugins keep it.
+#
+# expect: string: admin
+# expect: absent-default: []
+# expect: absent-fallback: public
+# expect: int: 25
+# expect: bool: true
+# expect: float: 1.5
+# expect: none: fb
+# expect: list: fb
+# expect: bare-route: [fb]
+# expect: not-found: 404 seen=[none]
+# expect: guard-denied: 403 admin only
+# expect: guard-allowed: 200 secret
+# expect: guard-public: 200 open
+# expect: payload-too-large: 413 upload
+# expect: plugin: 200 /v1/items items
+# expect: same-as-routeOptions: true
+# expect: http: 403 admin only
+
+from @lam/vulture import InjectResponse, Request, Response, RouteOptions, Server
+
+func describe(req: Request, _res: Response) -> str {
+    name: str = req.queryGet("name")
+    return req.routeMeta(name, req.queryGet("fallback"))
+}
+
+func guard(req: Request, res: Response) {
+    if req.routeMeta("access", "public") == "admin" and req.header("X-Role") != "admin" {
+        _ = res.code(403).text("admin only")
+    }
+}
+
+func secret(_req: Request, _res: Response) -> str {
+    return "secret"
+}
+
+func open(_req: Request, _res: Response) -> str {
+    return "open"
+}
+
+func tooLarge(req: Request, res: Response) {
+    _ = res.code(413).text(req.routeMeta("kind"))
+}
+
+func items(req: Request, _res: Response) -> str {
+    return f"{req.routerPath()} {req.routeMeta('kind')}"
+}
+
+func itemsPlugin(app: Server) {
+    app.get("/items", items, RouteOptions().metadata("kind", "items"))
+}
+
+func makeServer() -> Server {
+    srv: Server = Server()
+    opts: RouteOptions = RouteOptions()
+    _ = opts.metadata("role", "admin").metadata("limit", 25).metadata("beta", true)
+    _ = opts.metadata("ratio", 1.5).metadata("nothing", None).metadata("roles", ["a", "b"])
+    srv.get("/meta", describe, opts)
+    srv.get("/bare", describe)
+    srv.preHandler(guard)
+    srv.get("/admin", secret, RouteOptions().metadata("access", "admin"))
+    srv.get("/open", open, RouteOptions().metadata("access", "public"))
+    srv.post("/upload", open, RouteOptions(4).metadata("kind", "upload").onPayloadTooLarge(tooLarge))
+    srv.register(itemsPlugin, "/v1", true)
+    return srv
+}
+
+func main() {
+    srv: Server = makeServer()
+    func ask(name: str, fallback: str) -> str {
+        return srv.inject("GET", f"/meta?name={name}&fallback={fallback}").body
+    }
+    print(f"string: {ask('role', '')}")
+    print(f"absent-default: [{ask('missing', '')}]")
+    print(f"absent-fallback: {ask('missing', 'public')}")
+    print(f"int: {ask('limit', '')}")
+    print(f"bool: {ask('beta', '')}")
+    print(f"float: {ask('ratio', '')}")
+    print(f"none: {ask('nothing', 'fb')}")
+    print(f"list: {ask('roles', 'fb')}")
+    print(f"bare-route: [{srv.inject('GET', '/bare?name=role&fallback=fb').body}]")
+
+    seen: list[str] = []
+    probe: Server = Server()
+    func notFound(req: Request, res: Response) {
+        seen.append(req.routeMeta("access", "none"))
+        _ = res.code(404).text("nope")
+    }
+    probe.setNotFoundHandler(notFound)
+    r: InjectResponse = probe.inject("GET", "/nowhere")
+    print(f"not-found: {r.status} seen=[{seen[0]}]")
+
+    r = srv.inject("GET", "/admin")
+    print(f"guard-denied: {r.status} {r.body}")
+    r = srv.inject("GET", "/admin", "", {"X-Role": "admin"})
+    print(f"guard-allowed: {r.status} {r.body}")
+    r = srv.inject("GET", "/open")
+    print(f"guard-public: {r.status} {r.body}")
+    r = srv.inject("POST", "/upload", "too large")
+    print(f"payload-too-large: {r.status} {r.body}")
+    r = srv.inject("GET", "/v1/items")
+    print(f"plugin: {r.status} {r.body}")
+
+    same: list[bool] = []
+    check: Server = Server()
+    func compare(req: Request, _res: Response) -> str {
+        options: dict[str, any] = req.routeOptions()
+        meta: any = options["meta"]
+        fromOptions: str = ""
+        if isinstance(meta, dict) {
+            value: any = meta["access"]
+            if isinstance(value, str) {
+                fromOptions = value
+            }
+        }
+        same.append(fromOptions == req.routeMeta("access"))
+        return "ok"
+    }
+    check.get("/x", compare, RouteOptions().metadata("access", "user"))
+    _ = check.inject("GET", "/x")
+    print(f"same-as-routeOptions: {same[0]}")
+
+    _ = srv.listenBackground(0).unwrap()
+    address: str = srv.boundAddr
+    status: int = 0
+    body: str = ""
+    go! {
+        resp, err := http.Get("http://" + address + "/admin")
+        if err == nil {
+            data, _ := io.ReadAll(resp.Body)
+            resp.Body.Close()
+            status = resp.StatusCode
+            body = string(data)
+        }
+    }
+    srv.close()
+    print(f"http: {status} {body}")
+}
+
+go! {
+    import (
+        "io"
+        "net/http"
+    )
+}
