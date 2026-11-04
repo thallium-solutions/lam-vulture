@@ -41,7 +41,9 @@
 #   * Path parameters: ``/users/:id`` — exposed via ``req.params[":id"]``
 #     Any segment starting with ``:`` matches a single path segment.
 #   * Multiple methods on the same path are stored separately.
-#   * A request that matches no route returns ``404``.
+#   * A request that matches no route returns ``404``; a path known for
+#     other methods returns ``405`` with ``Allow`` (sorted, ``HEAD``
+#     listed with ``GET``: GET routes answer HEAD).
 #
 # Response short-circuiting:
 #   * If a hook calls ``res.setStatus`` or any of ``res.text/json/send``,
@@ -1500,6 +1502,55 @@ go! {
         return strings.ToLower(strings.TrimSpace(ct))
     }
 
+    // lamMediaTypeParts splits a media type (parameters dropped,
+    // lower-cased) into type and subtype; ok is false unless it is a
+    // single “type/subtype“ with both parts non-empty.
+    func lamMediaTypeParts(value string) (string, string, bool) {
+        key := lamContentTypeKey(value)
+        typ, sub, found := strings.Cut(key, "/")
+        if !found || typ == "" || sub == "" || strings.ContainsAny(typ, " \t") || strings.ContainsAny(sub, "/ \t") {
+            return "", "", false
+        }
+        return typ, sub, true
+    }
+
+    // lamMediaTypeIs: “req.is_(pattern)“ against the Content-Type
+    // “header“ (see “Request.is_“). A header that is not a concrete
+    // media type (absent, malformed, wildcards) matches nothing.
+    func lamMediaTypeIs(header, pattern string) bool {
+        typ, sub, ok := lamMediaTypeParts(header)
+        if !ok || typ == "*" || strings.Contains(sub, "*") {
+            return false
+        }
+        want := lamContentTypeKey(pattern)
+        switch want {
+        case "":
+            return false
+        case "*":
+            want = "*/*"
+        case "urlencoded":
+            want = "application/x-www-form-urlencoded"
+        }
+        if !strings.Contains(want, "/") {
+            if strings.HasPrefix(want, "+") {
+                return len(want) > 1 && len(sub) > len(want) && strings.HasSuffix(sub, want)
+            }
+            return typ == want || sub == want || strings.HasSuffix(sub, "+"+want)
+        }
+        wantType, wantSub, ok := lamMediaTypeParts(want)
+        if !ok || (wantType != "*" && wantType != typ) {
+            return false
+        }
+        switch {
+        case wantSub == "*":
+            return true
+        case strings.HasPrefix(wantSub, "*+"):
+            suffix := wantSub[1:]
+            return len(suffix) > 1 && len(sub) > len(suffix) && strings.HasSuffix(sub, suffix)
+        }
+        return wantSub == sub
+    }
+
     func lamReadHeader(req *Request, name string) string {
         for k, v := range req.Headers {
             if strings.EqualFold(k, name) {
@@ -2043,23 +2094,6 @@ go! {
         res.Sent = true
     }
 
-    // lamProblemDocument: “json(p)“ honouring a subclass's
-    // “__json__“. lamc 4.1.3 lowers “json(p)“ of a base-typed value
-    // to the base “__json__“; the instance's dynamic view (bound by
-    // the generated constructors) has the override. Falls back to the
-    // base document when the generated helper is absent.
-    func lamProblemDocument(p *Problem) LamJSON {
-        var target interface{} = p
-        if dyn, ok := target.(interface{ _lamDyn() interface{} }); ok {
-            if actual := dyn._lamDyn(); actual != nil {
-                if m, ok := actual.(lamJSONMarshaler); ok {
-                    return m.LamJSON()
-                }
-            }
-        }
-        return p.LamJSON()
-    }
-
     // lamSendServerProblem renders a framework problem.
     func lamSendServerProblem(res *Response, p *Problem) {
         lamWriteProblem(res, p.LamJSON(), p)
@@ -2102,10 +2136,13 @@ go! {
     }
 
     // lamWriteThrownProblem renders a thrown Problem (or subclass
-    // instance) with its own __json__.
+    // instance) with its own __json__: “lamJSONFrom“ is “json(rec)“,
+    // which runs the most-derived object's “__json__“ also when the
+    // value was thrown typed as “Problem“ (“throw make()“ with
+    // “make() -> Problem“ returning a subclass).
     func lamWriteThrownProblem(res *Response, rec interface{}, p *Problem) {
-        if m, ok := rec.(lamJSONMarshaler); ok {
-            lamWriteProblem(res, m.LamJSON(), p)
+        if doc, err := lamJSONFrom(rec); err == nil {
+            lamWriteProblem(res, doc, p)
             return
         }
         lamWriteProblem(res, p.LamJSON(), p)
@@ -2498,33 +2535,16 @@ class Request {
     }
 
     func formField(self, name: str, fallback: str = "") -> str {
-        #- Read a ``multipart/form-data`` field. Returns ``fallback``
-        if the field is absent or the body isn't multipart. The
-        parsed form is cached on the request so repeated reads
-        don't re-parse. -#
+        #- The first value of the text field ``name`` of an
+        ``application/x-www-form-urlencoded`` or ``multipart/form-data``
+        body (``""`` for an empty value); ``fallback`` when the field is
+        absent or the body is neither (file parts are not text fields:
+        ``formFile``). Same form as ``formValues`` / ``formFieldNames`` /
+        ``formFields``, parsed once and cached on the request. -#
         out: str = fallback
         go! {
-            ct := ""
-            for k, v := range s.Headers {
-                if strings.EqualFold(k, "Content-Type") {
-                    ct = v
-                    break
-                }
-            }
-            if strings.HasPrefix(strings.ToLower(ct), "multipart/form-data") {
-                form, ok := s.Ctx.Get("__lamMultipart", nil).(*lamMultipartForm)
-                if !ok {
-                    if f, err := lamParseMultipart(s.Body, ct); err == nil {
-                        s.Ctx.Set("__lamMultipart", f)
-                        form = f
-                        ok = true
-                    }
-                }
-                if ok {
-                    if values, ok := form.Fields[name]; ok && len(values) > 0 {
-                        out = values[0]
-                    }
-                }
+            if values, ok := lamRequestFormText(s).Values[name]; ok && len(values) > 0 {
+                out = values[0]
             }
         }
         return out
@@ -2926,17 +2946,31 @@ class Request {
     }
 
     func is_(self, type_: str) -> bool {
-        #- ``true`` iff the request's ``Content-Type`` contains
-        ``type_`` (case-insensitive, substring match — matching
-        Fastify's ``req.is(type)`` semantics, which accepts either
-        a full media type like ``"application/json"`` or a short
-        form like ``"json"``). Returns ``false`` when no
-        ``Content-Type`` header is set. -#
+        #- ``true`` iff the media type of the request's ``Content-Type``
+        matches ``type_`` (Fastify's ``req.is`` / ``type-is``).
+        Parameters (``; charset=utf-8``) are ignored on both sides and
+        comparisons are case-insensitive.
+
+        * ``"type/subtype"`` matches that type; ``*`` is a wildcard:
+          ``"multipart/*"``, ``"*/*"`` (also ``"*"``), ``"*/json"``, and
+          ``"application/*+json"`` / ``"+json"`` for a structured-syntax
+          suffix.
+        * A bare word matches the type, the subtype or the ``+suffix``:
+          ``"json"`` is ``application/json`` and any ``*/*+json``
+          (``application/problem+json``), ``"xml"`` ``application/xml``,
+          ``text/xml`` and ``*/*+xml``, ``"html"`` ``text/html``,
+          ``"multipart"`` / ``"text"`` any ``multipart/*`` / ``text/*``,
+          ``"form-data"`` ``multipart/form-data``.
+        * ``"urlencoded"`` is ``application/x-www-form-urlencoded``.
+
+        ``false`` without a ``Content-Type`` header, for an empty or
+        malformed one (no ``type/subtype``) and for an empty ``type_``. -#
         contentType: str = self.header("Content-Type")
-        if contentType == "" {
-            return false
+        out: bool = false
+        go! {
+            out = lamMediaTypeIs(contentType, type_)
         }
-        return contentType.toLower().contains(type_.toLower())
+        return out
     }
 
     func acceptedLanguages(self) -> list[str] {
@@ -3299,8 +3333,8 @@ class Response {
     }
 
     func cookie(self, name: str, value: str, path: str = "/", maxAge: int = 0,
-    domain: str = "", secure: bool = false, httpOnly: bool = false,
-    sameSite: str = "") -> Response {
+        domain: str = "", secure: bool = false, httpOnly: bool = false,
+        sameSite: str = "") -> Response {
         #- Append a ``Set-Cookie`` header with the modern attribute
         set. ``maxAge = 0`` means a session cookie; positive values
         use ``Max-Age=<n>``; negative values delete the cookie by
@@ -3348,16 +3382,18 @@ class Response {
         #- Send ``p`` (RFC 9457): status ``p.status``, ``Content-Type:
         application/problem+json``, ``Retry-After`` when ``p.retryAfter``
         is set, ``Allow`` when ``p.allow`` is, and ``json(p)`` as body with
-        the request path as ``instance`` when the document has none. -#
+        the request path as ``instance`` when the document has none. A
+        subclass's ``__json__`` override is honoured. -#
+        doc: json = json(p)
         go! {
-            lamWriteProblem(s, lamProblemDocument(p), p)
+            lamWriteProblem(s, doc, p)
         }
         return self
     }
 
     func signedCookie(self, name: str, value: str, secret: str, path: str = "/",
-    maxAge: int = 0, domain: str = "", secure: bool = false,
-    httpOnly: bool = true, sameSite: str = "Lax") -> Response {
+        maxAge: int = 0, domain: str = "", secure: bool = false,
+        httpOnly: bool = true, sameSite: str = "Lax") -> Response {
         #- Sign ``value`` with HMAC-SHA256(secret) and stash it as a
         ``Set-Cookie`` value. Read it back with ``Request.signedCookie``.
         Tampering with either the value or the signature on the
@@ -6741,6 +6777,10 @@ go! {
                 }
             } else if len(pathOnlyMethods) > 0 {
                 allowed := slices.Clone(pathOnlyMethods)
+                // A GET route answers HEAD too (lamTrieMatch).
+                if slices.Contains(allowed, "GET") {
+                    allowed = append(allowed, "HEAD")
+                }
                 slices.Sort(allowed)
                 lamRespondMethodNotAllowed(srv, req, res, strings.Join(slices.Compact(allowed), ", "))
             } else if srv.NotFoundHandler != nil {

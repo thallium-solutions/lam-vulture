@@ -12,7 +12,8 @@ formerly supplied by Lammergeier's `lamserver` standard-library module.
 
 ## Requirements
 
-- `lamc` 4.0 or newer (`>=4.0, <5`): handlers use the native `html` / `xml` types.
+- `lamc` 4.2 or newer (`>=4.2, <5`): handlers use the native `html` / `xml`
+  types, and a `Problem` subclass passed as a `Problem` keeps its `__json__`.
 - A Go toolchain available to `lamc`.
 
 ## Installation
@@ -26,7 +27,7 @@ lamc install https://github.com/thallium-solutions/lam-vulture.git
 Install the registry release:
 
 ```bash
-lamc install @lam/vulture@3.4.0
+lamc install @lam/vulture@3.4.1
 ```
 
 Install a local checkout during development:
@@ -201,6 +202,10 @@ throwing/`try*` or sentinel-returning twins:
   values. Missing, malformed, or signature-invalid data is never reported as an
   empty string, JSON null, or `None` sentinel.
 
+A GET route also answers HEAD (without a body). A path registered for other
+methods only answers 405 with an `Allow` header listing them sorted, `HEAD`
+included when there is a GET route (`GET, HEAD, POST`).
+
 Per-route configuration uses `RouteOptions` and actual `route`, `get`, `post`,
 `put`, `del`, `patch`, `head`, `options`, and `all` overloads:
 
@@ -238,8 +243,9 @@ The complete public implementation is exported from `__init__.lam`.
   routes, Result-based listeners/TLS, shutdown, typed `inject`, `listRoutes`,
   `printRoutes`, and `openapi`.
 - `Request` — method/path/body/header/query (`queryAll` for repeated parameters)/parameter data, cancellation-aware
-  `ctx`, Result-based JSON/form parsing and cookie verification, form fields
-  (`formValues`, `formFieldNames`, `formFields`; below), multipart files,
+  `ctx`, Result-based JSON/form parsing and cookie verification, the body's
+  media type (`is_`; below), form fields (`formField`, `formValues`,
+  `formFieldNames`, `formFields`; below), multipart files,
   streaming body readers, proxy-aware IP/scheme helpers, decorators,
   request IDs, route metadata (`routeOptions`, `routeMeta`), content
   negotiation (`acceptsLanguage`, `acceptedLanguages`, `accepts`), timing,
@@ -269,7 +275,7 @@ These read the text fields of `application/x-www-form-urlencoded` and
 | `req.formValues(name) -> list[str]` | every value of `name` in body order (checkbox groups: `brand=a&brand=b`); `[]` when absent |
 | `req.formFieldNames() -> list[str]` | field names in first-appearance order, without duplicates |
 | `req.formFields() -> dict[str, list[str]]` | every field: name -> values in order |
-| `req.formField(name, fallback = "") -> str` | first value of a multipart field (`fallback` when absent) |
+| `req.formField(name, fallback = "") -> str` | the first value of `name` (`fallback` when absent) |
 | `req.formFile(name) -> any` / `req.formFiles(name) -> list[any]` | the first / every file part of a multipart field |
 
 Values are decoded (`+` is a space, `%C3%A8` is `è`); an empty value
@@ -278,15 +284,48 @@ only in `formFile` / `formFiles`. Malformed urlencoded pairs are skipped and a
 malformed multipart body has no fields. The body is parsed once, on first use,
 from the buffered body (so the route or server body limit already applied:
 oversized bodies get 413 before the handler) and cached on the request;
-multipart parsing is shared with `formField`, `formFile` and `formFiles`.
-Routes with `streamBody` have no buffered body, hence no fields. The returned
-lists and dicts are copies.
+every method reads the same parsed form (multipart parsing is also shared
+with `formFile` and `formFiles`). Routes with `streamBody` have no buffered
+body, hence no fields (`formField` gives `fallback`). The returned lists and
+dicts are copies.
 
 ```lammergeier
 func filter(req: Request, res: Response) -> json {
     brands: list[str] = req.formValues("brand")
     categories: list[str] = [name for name in req.formFieldNames() if name.startsWith("cat:")]
     return {"brands": len(brands), "categories": len(categories)}
+}
+```
+
+### Request media type
+
+`req.is_(type) -> bool` tells whether the media type of the request's
+`Content-Type` matches `type` (modelled on Fastify's `req.is` / `type-is`).
+Parameters (`; charset=utf-8`, `; boundary=...`) are ignored on both sides
+and the comparison is case-insensitive:
+
+| `type` | Matches |
+| --- | --- |
+| `"application/json"` | exactly that media type |
+| `"multipart/*"`, `"*/*"` (or `"*"`), `"*/json"` | `*` as the type or the subtype |
+| `"application/*+json"`, `"+json"` | a structured-syntax suffix: `application/problem+json`, `application/vnd.api+json` |
+| `"json"`, `"xml"` | `application/json` / `application/xml`, `text/xml`, and any `+json` / `+xml` suffix |
+| `"html"`, `"form-data"`, `"plain"`, ... | a bare word: the subtype (`text/html`, `multipart/form-data`) |
+| `"multipart"`, `"text"`, ... | a bare word: the type (`multipart/*`, `text/*`) |
+| `"urlencoded"` | `application/x-www-form-urlencoded` |
+
+It is `false` without a `Content-Type` header, for an empty or malformed one
+(`garbage`, `text/`, a wildcard such as `*/*`) and for an empty `type`. Words
+that are only part of the header (`"form"`, `"charset"`, `"boundary"`) no
+longer match.
+
+```lammergeier
+func signup(req: Request, res: Response) -> str {
+    if not req.is_("urlencoded") and not req.is_("multipart/form-data") {
+        res.code(415)
+        return "send a form"
+    }
+    return f"{req.formField('email')} {len(req.formValues('topic'))}"
 }
 ```
 
@@ -306,7 +345,7 @@ from @lam/vulture import Request, Response, RouteOptions, Server
 
 func guard(req: Request, res: Response) {
     if req.routeMeta("access", "public") == "admin" and req.header("X-Role") != "admin" {
-        _ = res.code(403).text("admin only")
+        res.code(403).text("admin only")
     }
 }
 
@@ -359,16 +398,16 @@ const Greetings: dict[str, str] = {"it": "Ciao", "en": "Hello", "fr-CA": "Bonjou
 
 func greet(req: Request, res: Response) {
     lang: str = req.acceptsLanguage(["it", "en", "fr-CA"], "en")
-    _ = res.header("Vary", "Accept, Accept-Language").header("Content-Language", lang)
+    res.header("Vary", "Accept, Accept-Language").header("Content-Language", lang)
     match req.accepts(["application/json", "text/plain"]) {
         case "application/json" {
-            _ = res.json({"greeting": Greetings[lang]})
+            res.json({"greeting": Greetings[lang]})
         }
         case "text/plain" {
-            _ = res.text(Greetings[lang])
+            res.text(Greetings[lang])
         }
         case _ {
-            _ = res.problem(Problem(406).withExtension("accepted", ["application/json", "text/plain"]))
+            res.problem(Problem(406).withExtension("accepted", ["application/json", "text/plain"]))
         }
     }
 }
@@ -394,13 +433,13 @@ from @lam/vulture import HttpError, Problem, Request, Response, Server
 func transfer(req: Request, res: Response) {
     if req.header("X-Balance") == "0" {
         p: Problem = Problem(403, "Insufficient funds", "Your balance is 0, the transfer costs 30.", "https://example.com/problems/out-of-credit")
-        _ = res.problem(p.withExtension("balance", 0).withExtension("cost", 30))
+        res.problem(p.withExtension("balance", 0).withExtension("cost", 30))
         return
     }
     if req.header("X-Busy") != "" {
         throw HttpError.serviceUnavailable("try again in a minute").withRetryAfter(60)
     }
-    _ = res.code(204).send("")
+    res.code(204).send("")
 }
 
 func main() {
@@ -439,7 +478,8 @@ of the request (`The request body is not valid.`), the `in` extension is
 `where`, `errors` holds `json(issue)` of every issue. `throw p` (from a hook
 or a handler) sends `p` like `res.problem(p)`, whatever the server options;
 a `Problem` subclass may override `__json__`, and both `throw` and
-`res.problem` render it with the override.
+`res.problem` render it with the override, also when the value is typed
+`Problem` (a variable, a list element, a parameter, a function's result).
 
 `HttpError(status, message, data)` keeps its JSON envelope
 (`{"statusCode", "error", "message", "data"}`) unless problem details are
@@ -649,11 +689,11 @@ Issues are sorted by field (array indexes numerically), then keyword
 ```lammergeier
 from @lam/vulture import Problem, Request, Response, SchemaIssue, Server
 
-func validationProblem(where: str, issues: list[SchemaIssue], req: Request, res: Response) {
+func validationProblem(where: str, issues: list[SchemaIssue], _req: Request, res: Response) {
     p: Problem = Problem.validation(where, issues, 422)
     p.type_ = "https://example.com/problems/validation"
     p.title = "The request is not valid"
-    _ = res.problem(p)
+    res.problem(p)
 }
 
 func main() {
@@ -688,7 +728,7 @@ set are kept) or raises, the default text answers.
 ```lammergeier
 func tooLarge(req: Request, res: Response) {
     limit: str = req.routeMeta("limitText", "10 MiB")
-    _ = res.problem(Problem(413, "", f"Uploads are limited to {limit}."))
+    res.problem(Problem(413, "", f"Uploads are limited to {limit}."))
 }
 
 app.setPayloadTooLargeHandler(tooLarge)
@@ -725,7 +765,7 @@ as JSON as before (a problem document with `useProblemDetails`).
 python3 tests/run_tests.py --verbose
 ```
 
-The runner requires `lamc >= 4.0.0`, stages this checkout as
+The runner requires `lamc >= 4.2.0`, stages this checkout as
 `extlibs/@lam/vulture` in an isolated temporary directory, compiles without the
 compiler cache, runs every migrated central end-to-end server test, and compares
 stdout against the original exact `# expect:` output. Tests for the standard

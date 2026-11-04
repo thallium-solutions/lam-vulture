@@ -1,0 +1,189 @@
+# Test: req.formField(name, fallback) reads application/x-www-form-urlencoded
+# bodies like multipart ones: the first value of a repeated key, decoded
+# (+ and percent escapes), "" for an empty value, the fallback when the field
+# is absent or the body has no form fields (JSON, text, no Content-Type,
+# streamBody routes); Content-Type parameters and case are ignored; the
+# parsed form is shared with formValues / formFieldNames / formFields. Over
+# inject and a real listener (browser-style form posts, 413 before parsing,
+# a streamed route still reading its raw body).
+#
+# expect: first: nike values=nike|adidas
+# expect: decoded: red shoes|Caffè latte|1+1 = 2|a&b
+# expect: empty: [] flag=[]
+# expect: absent: [none] []
+# expect: charset: x
+# expect: upper-case: x
+# expect: json-body: none
+# expect: text-body: none
+# expect: no-content-type: none
+# expect: malformed: [none] b=2
+# expect: shared: names=q,brand q=1 values=2 cached=true
+# expect: multipart-unchanged: report x files=1
+# expect: parsed-body-agrees: nike nike
+# expect: http-form: 200 q=red shoes brand=nike missing=fallback
+# expect: http-limited: 413
+# expect: http-streamed: 200 field=[none] body=brand=a&brand=b
+# expect: http-multipart: 200 title=report tag=x
+
+from @lam/vulture import InjectResponse, Request, Response, RouteOptions, Server
+
+const Boundary: str = "FormFieldBoundary"
+const Form: dict[str, str] = {"Content-Type": "application/x-www-form-urlencoded"}
+
+func first(req: Request, _res: Response) -> str {
+    return f"{req.formField('brand')} values={'|'.join(req.formValues('brand'))}"
+}
+
+func decoded(req: Request, _res: Response) -> str {
+    return "|".join([req.formField("q"), req.formField("drink"), req.formField("expr"), req.formField("k&y")])
+}
+
+func empty(req: Request, _res: Response) -> str {
+    return f"[{req.formField('size', 'x')}] flag=[{req.formField('flag', 'x')}]"
+}
+
+func absent(req: Request, _res: Response) -> str {
+    return f"[{req.formField('nope', 'none')}] [{req.formField('nope')}]"
+}
+
+func one(req: Request, _res: Response) -> str {
+    return req.formField("a", "none")
+}
+
+func malformed(req: Request, _res: Response) -> str {
+    return f"[{req.formField('a', 'none')}] b={req.formField('b')}"
+}
+
+func shared(req: Request, _res: Response) -> str {
+    q: str = req.formField("q")
+    cached: bool = false
+    go! {
+        cached = req.Ctx.Get("__lamUrlencoded", nil) != nil
+    }
+    return f"names={','.join(req.formFieldNames())} q={q} values={len(req.formValues('brand'))} cached={cached}"
+}
+
+func multipartFields(req: Request, _res: Response) -> str {
+    return f"{req.formField('title')} {req.formField('tag')} files={len(req.formFiles('doc'))}"
+}
+
+func parsedAgrees(req: Request, _res: Response) -> str {
+    parsed: any = req.parsedBody().unwrap()
+    viaParsed: str = ""
+    if isinstance(parsed, dict) {
+        viaParsed = str(parsed["brand"])
+    }
+    return f"{req.formField('brand')} {viaParsed}"
+}
+
+func httpForm(req: Request, _res: Response) -> str {
+    return f"q={req.formField('q')} brand={req.formField('brand')} missing={req.formField('missing', 'fallback')}"
+}
+
+func streamed(req: Request, _res: Response) -> str {
+    body: str = str(req.bodyReader().readAll().unwrap())
+    return f"field=[{req.formField('brand', 'none')}] body={body}"
+}
+
+func multipartHttp(req: Request, _res: Response) -> str {
+    return f"title={req.formField('title')} tag={req.formField('tag')}"
+}
+
+func textPart(name: str, value: str) -> str {
+    return f"--{Boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+}
+
+func filePart(name: str, filename: str, content: str) -> str {
+    return f"--{Boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: text/plain\r\n\r\n{content}\r\n"
+}
+
+func main() {
+    srv: Server = Server()
+    srv.post("/first", first)
+    srv.post("/decoded", decoded)
+    srv.post("/empty", empty)
+    srv.post("/absent", absent)
+    srv.post("/one", one)
+    srv.post("/malformed", malformed)
+    srv.post("/shared", shared)
+    srv.post("/multipart", multipartFields)
+    srv.post("/parsed", parsedAgrees)
+    srv.post("/form", httpForm)
+    srv.post("/limited", httpForm, RouteOptions(16))
+    srv.post("/streamed", streamed, RouteOptions(0, 0, true))
+    srv.post("/upload", multipartHttp)
+
+    func post(path: str, body: str, headers: dict[str, str] = Form) -> str {
+        r: InjectResponse = srv.inject("POST", path, body, headers)
+        return r.body
+    }
+
+    print(f"first: {post('/first', 'brand=nike&size=42&brand=adidas')}")
+    print(f"decoded: {post('/decoded', 'q=red+shoes&drink=Caff%C3%A8%20latte&expr=1%2B1+%3D+2&k%26y=a%26b')}")
+    print(f"empty: {post('/empty', 'size=&flag')}")
+    print(f"absent: {post('/absent', 'a=1')}")
+    charset: dict[str, str] = {"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"}
+    print(f"charset: {post('/one', 'a=x', charset)}")
+    upper: dict[str, str] = {"Content-Type": "Application/X-WWW-Form-URLEncoded"}
+    print(f"upper-case: {post('/one', 'a=x', upper)}")
+    jsonType: dict[str, str] = {"Content-Type": "application/json"}
+    print("json-body: " + post("/one", "{\"a\": \"x\"}", jsonType))
+    textType: dict[str, str] = {"Content-Type": "text/plain"}
+    print(f"text-body: {post('/one', 'a=x', textType)}")
+    noType: dict[str, str] = {}
+    print(f"no-content-type: {post('/one', 'a=x', noType)}")
+    print(f"malformed: {post('/malformed', 'a=%zz&b=2')}")
+    print(f"shared: {post('/shared', 'q=1&brand=a&brand=b')}")
+    multipartBody: str = textPart("title", "report") + filePart("doc", "a.txt", "alpha") + textPart("tag", "x") + textPart("tag", "y") + f"--{Boundary}--\r\n"
+    multipartType: dict[str, str] = {"Content-Type": f"multipart/form-data; boundary={Boundary}"}
+    print(f"multipart-unchanged: {post('/multipart', multipartBody, multipartType)}")
+    print(f"parsed-body-agrees: {post('/parsed', 'brand=nike&brand=adidas')}")
+
+    _ = srv.listenBackground(0).unwrap()
+    go! {
+        base := "http://" + srv.BoundAddr
+        defer srv.Shutdown(5000)
+
+        call := func(path string, contentType string, body io.Reader) (int, string) {
+            resp, err := http.Post(base+path, contentType, body)
+            if err != nil {
+                return 0, err.Error()
+            }
+            defer resp.Body.Close()
+            data, _ := io.ReadAll(resp.Body)
+            return resp.StatusCode, string(data)
+        }
+
+        resp, err := http.PostForm(base+"/form", url.Values{"q": {"red shoes"}, "brand": {"nike", "adidas"}})
+        if err == nil {
+            data, _ := io.ReadAll(resp.Body)
+            resp.Body.Close()
+            fmt.Printf("http-form: %d %s\n", resp.StatusCode, data)
+        }
+        status, _ := call("/limited", "application/x-www-form-urlencoded", strings.NewReader("q="+strings.Repeat("x", 64)))
+        fmt.Printf("http-limited: %d\n", status)
+        status, text := call("/streamed", "application/x-www-form-urlencoded", strings.NewReader("brand=a&brand=b"))
+        fmt.Printf("http-streamed: %d %s\n", status, text)
+
+        var buf bytes.Buffer
+        mw := multipart.NewWriter(&buf)
+        mw.WriteField("title", "report")
+        mw.WriteField("tag", "x")
+        mw.WriteField("tag", "y")
+        mw.Close()
+        status, text = call("/upload", mw.FormDataContentType(), &buf)
+        fmt.Printf("http-multipart: %d %s\n", status, text)
+    }
+}
+
+go! {
+    import (
+        "bytes"
+        "fmt"
+        "io"
+        "mime/multipart"
+        "net/http"
+        "net/url"
+        "strings"
+    )
+}

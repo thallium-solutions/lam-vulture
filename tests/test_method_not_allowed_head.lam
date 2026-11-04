@@ -1,0 +1,115 @@
+# Test: the Allow header of a 405 lists HEAD whenever a GET route answers
+# the path (GET routes answer HEAD), sorted and without duplicates: GET-only,
+# GET + POST, an explicit HEAD route next to GET, parametric and wildcard
+# paths, prefixed plugin routes; paths without a GET route do not gain HEAD
+# (POST-only, HEAD-only, a HEAD request to a POST route). The problem
+# document's detail and Allow agree; HEAD itself still gets 200 from GET.
+# Over inject and a real listener.
+#
+# expect: get-only: 405 GET, HEAD
+# expect: get-post: 405 GET, HEAD, POST
+# expect: get-explicit-head: 405 GET, HEAD
+# expect: param: 405 GET, HEAD, PUT
+# expect: wildcard: 405 GET, HEAD
+# expect: plugin: 405 GET, HEAD
+# expect: post-only: 405 POST
+# expect: head-to-post-only: 405 POST
+# expect: head-only: 405 HEAD
+# expect: delete-patch: 405 DELETE, PATCH
+# expect: head-still-ok: 200 0
+# expect: problem: 405 application/problem+json GET, HEAD, POST Method DELETE is not allowed; allowed: GET, HEAD, POST.
+# expect: http-get-only: 405 GET, HEAD
+# expect: http-head-to-post-only: 405 POST
+# expect: http-problem: 405 application/problem+json GET, HEAD
+
+from lamjson import Json
+from @lam/vulture import InjectResponse, Request, Response, Server
+
+func ok(_req: Request, _res: Response) -> str {
+    return "ok"
+}
+
+func plugin(app: Server) {
+    app.get("/items", ok)
+}
+
+func addRoutes(srv: Server) {
+    srv.get("/get-only", ok)
+    srv.get("/get-post", ok)
+    srv.post("/get-post", ok)
+    srv.get("/both", ok)
+    srv.head("/both", ok)
+    srv.get("/users/:id", ok)
+    srv.put("/users/:id", ok)
+    srv.get("/files/*", ok)
+    srv.post("/post-only", ok)
+    srv.head("/head-only", ok)
+    srv.del("/edit", ok)
+    srv.patch("/edit", ok)
+    srv.register(plugin, "/v1", true)
+}
+
+func main() {
+    srv: Server = Server()
+    addRoutes(srv)
+    problems: Server = Server()
+    problems.useProblemDetails()
+    addRoutes(problems)
+
+    func allow(label: str, method: str, path: str) {
+        r: InjectResponse = srv.inject(method, path)
+        print(f"{label}: {r.status} {r.header('Allow')}")
+    }
+
+    allow("get-only", "POST", "/get-only")
+    allow("get-post", "DELETE", "/get-post")
+    allow("get-explicit-head", "PUT", "/both")
+    allow("param", "POST", "/users/7")
+    allow("wildcard", "DELETE", "/files/a/b.txt")
+    allow("plugin", "POST", "/v1/items")
+    allow("post-only", "GET", "/post-only")
+    allow("head-to-post-only", "HEAD", "/post-only")
+    allow("head-only", "GET", "/head-only")
+    allow("delete-patch", "GET", "/edit")
+    head: InjectResponse = srv.inject("HEAD", "/get-only")
+    print(f"head-still-ok: {head.status} {len(head.body)}")
+
+    r: InjectResponse = problems.inject("DELETE", "/get-post")
+    detail: str = Json.decode(r.body).unwrap()["detail"]
+    print(f"problem: {r.status} {r.header('Content-Type')} {r.header('Allow')} {detail}")
+
+    _ = srv.listenBackground(0).unwrap()
+    _ = problems.listenBackground(0).unwrap()
+    plainAddr: str = srv.boundAddr
+    problemAddr: str = problems.boundAddr
+    go! {
+        call := func(method string, url string) string {
+            request, _ := http.NewRequest(method, url, nil)
+            resp, err := http.DefaultClient.Do(request)
+            if err != nil {
+                return err.Error()
+            }
+            defer resp.Body.Close()
+            _, _ = io.ReadAll(resp.Body)
+            ct := ""
+            if strings.HasPrefix(resp.Header.Get("Content-Type"), "application/problem+json") {
+                ct = "application/problem+json "
+            }
+            return fmt.Sprintf("%d %s%s", resp.StatusCode, ct, resp.Header.Get("Allow"))
+        }
+        fmt.Printf("http-get-only: %s\n", call("POST", "http://"+plainAddr+"/get-only"))
+        fmt.Printf("http-head-to-post-only: %s\n", call("HEAD", "http://"+plainAddr+"/post-only"))
+        fmt.Printf("http-problem: %s\n", call("PUT", "http://"+problemAddr+"/get-only"))
+    }
+    srv.close()
+    problems.close()
+}
+
+go! {
+    import (
+        "fmt"
+        "io"
+        "net/http"
+        "strings"
+    )
+}

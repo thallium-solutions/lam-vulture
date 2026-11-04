@@ -15,7 +15,7 @@
 # expect: teapot: 418 I'm a teapot
 # expect: cookie set: true
 # expect: 405 status: 405
-# expect: 405 allow: GET
+# expect: 405 allow: GET, HEAD
 # expect: prefix v1: hello-v1
 # expect: prefix v2: hello-v2
 # expect: cors preflight: 204

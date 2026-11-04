@@ -1,0 +1,181 @@
+# Test: a Problem subclass reached through a base-typed value keeps its
+# __json__ (lamc 4.2.0 dispatches json(p) to the most-derived object).
+#
+# res.problem(p) with p typed Problem (a variable, a list element, a helper's
+# parameter, a catch binding, a grandchild inheriting the override), json(p)
+# in user code, a thrown subclass with and without useProblemDetails, and the
+# same answers over a real listener. The subclass's __json__ reads the fields
+# it inherits from the package's Problem directly (self.title, self.status).
+#
+# expect: var: 418 application/problem+json {"detail":"No coffee here.","flavour":"earl grey","instance":"/var","status":418,"title":"Teapot","type":"urn:tea"}
+# expect: list-base: 400 {"instance":"/list","status":400,"title":"Bad Request","type":"about:blank"}
+# expect: list-sub: 418 oolong /list
+# expect: helper: 418 sencha
+# expect: grandchild: 418 green /grandchild
+# expect: catch: 418 matcha
+# expect: thrown: 418 application/problem+json rooibos
+# expect: thrown-problems-on: 418 application/problem+json rooibos /thrown
+# expect: user-json: oolong 418 Teapot
+# expect: user-json-base: about:blank 400
+# expect: str: Problem(418 Teapot): No coffee here.
+# expect: http-var: 418 application/problem+json earl grey /var
+# expect: http-grandchild: 418 green cups-member=false
+# expect: http-thrown: 418 rooibos
+
+from lamjson import Json
+from @lam/vulture import InjectResponse, Problem, Request, Response, Server
+
+class TeapotProblem(Problem) {
+    func init(self, flavour: str) {
+        base.init(418, "Teapot", "No coffee here.", "urn:tea")
+        self.flavour: str = flavour
+    }
+
+    func __json__(self) -> json {
+        doc: json = {"type": self.type_, "title": self.title, "status": self.status, "detail": self.detail, "flavour": self.flavour}
+        if self.instance != "" {
+            doc["instance"] = self.instance
+        }
+        return doc
+    }
+}
+
+class GreenTeaProblem(TeapotProblem) {
+    func init(self) {
+        base.init("green")
+        self.cups: int = 2
+    }
+}
+
+func asProblem(flavour: str) -> Problem {
+    return TeapotProblem(flavour)
+}
+
+func sendProblem(res: Response, p: Problem) {
+    _ = res.problem(p)
+}
+
+func viaVar(_req: Request, res: Response) {
+    p: Problem = TeapotProblem("earl grey")
+    _ = res.problem(p)
+}
+
+func viaList(req: Request, res: Response) {
+    problems: list[Problem] = [Problem(400), TeapotProblem("oolong")]
+    index: int = 1 if req.query["i"] == "1" else 0
+    _ = res.problem(problems[index])
+}
+
+func viaHelper(_req: Request, res: Response) {
+    sendProblem(res, asProblem("sencha"))
+}
+
+func viaGrandchild(_req: Request, res: Response) {
+    p: Problem = GreenTeaProblem()
+    _ = res.problem(p)
+}
+
+func viaCatch(_req: Request, res: Response) {
+    try {
+        throw TeapotProblem("matcha")
+    } catch Problem as e {
+        _ = res.problem(e)
+    }
+}
+
+func thrown(_req: Request, _res: Response) {
+    throw asProblem("rooibos")
+}
+
+func addRoutes(srv: Server) {
+    srv.get("/var", viaVar)
+    srv.get("/list", viaList)
+    srv.get("/helper", viaHelper)
+    srv.get("/grandchild", viaGrandchild)
+    srv.get("/catch", viaCatch)
+    srv.get("/thrown", thrown)
+}
+
+func field(r: InjectResponse, name: str) -> str {
+    doc: json = Json.decode(r.body).unwrap()
+    value: str = doc[name] ?? ""
+    return value
+}
+
+func main() {
+    srv: Server = Server()
+    addRoutes(srv)
+    problems: Server = Server()
+    problems.useProblemDetails("https://example.com/problems/")
+    addRoutes(problems)
+
+    func get(path: str, on: Server = srv) -> InjectResponse {
+        return on.inject("GET", path)
+    }
+
+    r: InjectResponse = get("/var")
+    print(f"var: {r.status} {r.header('Content-Type')} {r.body}")
+    r = get("/list")
+    print(f"list-base: {r.status} {r.body}")
+    r = get("/list?i=1")
+    print(f"list-sub: {r.status} {field(r, 'flavour')} {field(r, 'instance')}")
+    r = get("/helper")
+    print(f"helper: {r.status} {field(r, 'flavour')}")
+    r = get("/grandchild")
+    print(f"grandchild: {r.status} {field(r, 'flavour')} {field(r, 'instance')}")
+    r = get("/catch")
+    print(f"catch: {r.status} {field(r, 'flavour')}")
+    r = get("/thrown")
+    print(f"thrown: {r.status} {r.header('Content-Type')} {field(r, 'flavour')}")
+    r = get("/thrown", on = problems)
+    print(f"thrown-problems-on: {r.status} {r.header('Content-Type')} {field(r, 'flavour')} {field(r, 'instance')}")
+
+    p: Problem = asProblem("oolong")
+    doc: json = json(p)
+    flavour: str = doc["flavour"]
+    status: int = doc["status"]
+    title: str = doc["title"]
+    print(f"user-json: {flavour} {status} {title}")
+    plain: json = json(Problem(400))
+    kind: str = plain["type"]
+    plainStatus: int = plain["status"]
+    print(f"user-json-base: {kind} {plainStatus}")
+    print(f"str: {str(p)}")
+
+    _ = srv.listenBackground(0).unwrap()
+    address: str = srv.boundAddr
+    lines: list[str] = []
+    go! {
+        fetch := func(path string) (int, string, map[string]interface{}) {
+            resp, err := http.Get("http://" + address + path)
+            if err != nil {
+                return 0, err.Error(), nil
+            }
+            defer resp.Body.Close()
+            data, _ := io.ReadAll(resp.Body)
+            var doc map[string]interface{}
+            _ = json.Unmarshal(data, &doc)
+            return resp.StatusCode, resp.Header.Get("Content-Type"), doc
+        }
+        got, ct, body := fetch("/var")
+        lines = append(lines, fmt.Sprintf("http-var: %d %s %v %v", got, ct, body["flavour"], body["instance"]))
+        got, _, body = fetch("/grandchild")
+        _, hasCups := body["cups"]
+        lines = append(lines, fmt.Sprintf("http-grandchild: %d %v cups-member=%v", got, body["flavour"], hasCups))
+        got, _, body = fetch("/thrown")
+        lines = append(lines, fmt.Sprintf("http-thrown: %d %v", got, body["flavour"]))
+    }
+    srv.close()
+    for line in lines {
+        print(line)
+    }
+}
+
+go! {
+    import (
+        "encoding/json"
+        "fmt"
+        "io"
+        "net/http"
+    )
+}

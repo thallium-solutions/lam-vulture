@@ -7,8 +7,10 @@
 # issue handler building Problem.validation(...) with res.problem; media
 # negotiation with req.accepts (406 as a problem with an extension); the
 # server's useProblemDetails covering 404 / 405 / 413 / HttpError with a type
-# prefix. Exercises classes with inheritance and __json__ overrides, nested
-# functions, lambdas, comprehensions, match, dict lookups and Result.
+# prefix. Exercises classes with inheritance and __json__ overrides reading
+# inherited fields, nested functions (with default parameters), a function
+# named like a const but for the case (languages / Languages), comprehensions
+# (also in f-strings), match, dict lookups and Result.
 #
 # expect: unauthenticated-en: 401 application/problem+json https://shop.example/problems/unauthenticated Sign in first. code=unauthenticated lang=en
 # expect: unauthenticated-it: 401 Accedi prima. lang=it
@@ -22,7 +24,7 @@
 # expect: upload-missing-part: 422 multipart data::required
 # expect: upload-json-body: 422 body :price:minimum
 # expect: not-found: 404 https://shop.example/problems/not-found
-# expect: method: 405 https://shop.example/problems/method-not-allowed GET, POST
+# expect: method: 405 https://shop.example/problems/method-not-allowed GET, HEAD, POST
 # expect: too-large: 413 https://shop.example/problems/content-too-large
 # expect: http-error: 409 https://shop.example/problems/conflict sku=B-1
 # expect: public-route-no-guard: 200 en,it
@@ -50,18 +52,12 @@ class ApiProblem(Problem) {
     }
 
     func __json__(self) -> json {
-        kind: str = self.type_
-        title: str = self.title
-        status: int = self.status
-        detail: str = self.detail
-        instance: str = self.instance
-        errors: list[json] = self.errors
-        doc: json = {"type": kind, "title": title, "status": status, "detail": detail, "code": self.code, "lang": self.lang}
-        if instance != "" {
-            doc["instance"] = instance
+        doc: json = {"type": self.type_, "title": self.title, "status": self.status, "detail": self.detail, "code": self.code, "lang": self.lang}
+        if self.instance != "" {
+            doc["instance"] = self.instance
         }
-        if len(errors) > 0 {
-            doc["errors"] = errors
+        if len(self.errors) > 0 {
+            doc["errors"] = self.errors
         }
         return doc
     }
@@ -119,7 +115,7 @@ func duplicate(req: Request, res: Response) {
     _ = res.problem(ApiProblem(409, "conflict", langOf(req)))
 }
 
-func listLanguages(req: Request, _res: Response) -> str {
+func languages(req: Request, _res: Response) -> str {
     return ",".join(req.acceptedLanguages())
 }
 
@@ -146,7 +142,7 @@ func api(app: Server) {
     _ = uploadOptions.withSchema({"body": productSchema(), "multipartJson": {"data": productSchema()}})
     app.post("/products", upload, uploadOptions)
     app.post("/conflict", conflict, RouteOptions().metadata("access", "user"))
-    app.get("/languages", listLanguages)
+    app.get("/languages", languages)
     app.put("/duplicate", duplicate)
 }
 
@@ -187,10 +183,14 @@ func issueList(doc: json) -> str {
 
 func main() {
     srv: Server = makeServer()
-    auth: dict[str, str] = {"Authorization": "Bearer t", "Content-Type": f"multipart/form-data; boundary={Boundary}"}
-    withLang: func(str) -> dict[str, str] = lambda(lang: str) -> dict[str, str] {
-        return {"Authorization": "Bearer t", "Content-Type": f"multipart/form-data; boundary={Boundary}", "Accept-Language": lang}
+    func uploadHeaders(lang: str = "") -> dict[str, str] {
+        headers: dict[str, str] = {"Authorization": "Bearer t", "Content-Type": f"multipart/form-data; boundary={Boundary}"}
+        if lang != "" {
+            headers["Accept-Language"] = lang
+        }
+        return headers
     }
+    auth: dict[str, str] = uploadHeaders()
     statuses: list[int] = []
     func run(method: str, path: str, body: str, headers: dict[str, str]) -> InjectResponse {
         r: InjectResponse = srv.inject(method, path, body, headers)
@@ -234,13 +234,13 @@ func main() {
     r = run("POST", "/api/products", good, auth)
     print(f"upload-ok: {r.status} {r.body}")
     bad: str = form([part("data", "{\"name\": \"Bag\", \"price\": -1, \"sku\": \"bad\"}")])
-    r = run("POST", "/api/products", bad, withLang("it"))
+    r = run("POST", "/api/products", bad, uploadHeaders("it"))
     doc = docOf(r)
     kind = doc["type"]
     detail = doc["detail"]
     where: str = doc["in"]
     print(f"upload-invalid-it: {r.status} {kind.split('/')[-1]} {detail} {where} {issueList(doc)}")
-    r = run("POST", "/api/products", bad, withLang("en-US"))
+    r = run("POST", "/api/products", bad, uploadHeaders(lang = "en-US"))
     doc = docOf(r)
     detail = doc["detail"]
     where = doc["in"]
@@ -282,8 +282,7 @@ func main() {
     instancePath: str = doc["instance"]
     print(f"res-problem-subclass: {r.status} {r.header('Content-Type')} code={code} lang={lang} {detail} {instancePath}")
 
-    known: list[int] = [s for s in statuses if s in [200, 201, 401, 404, 405, 406, 409, 413, 422]]
-    print(f"summary: {len(statuses)} cases, {len(known)} problems-or-ok")
+    print(f"summary: {len(statuses)} cases, {len([s for s in statuses if s in [200, 201, 401, 404, 405, 406, 409, 413, 422]])} problems-or-ok")
 
     _ = srv.listenBackground(0).unwrap()
     address: str = srv.boundAddr

@@ -1,0 +1,99 @@
+# Test: req.is_(type) matches the request's media type, not a substring of
+# the Content-Type header: parameters are ignored, comparisons are
+# case-insensitive, "type/subtype" patterns match exactly or with "*"
+# ("multipart/*", "*/*", "application/*+json", "+json"), a bare word names
+# the type, the subtype or a "+suffix" ("json" covers application/json and
+# application/problem+json, "multipart", "html", "form-data"), "urlencoded"
+# is application/x-www-form-urlencoded; an absent, empty or malformed
+# Content-Type and an empty pattern never match. Over inject and HTTP.
+#
+# expect: json-charset: json=true application/json=true APPLICATION/JSON=true application/*=true */*=true */json=true application/json; charset=utf-8=true html=false text/*=false +json=false charset=false utf-8=false
+# expect: problem-json: json=true +json=true application/*+json=true */*+json=true application/problem+json=true application/json=false problem=false
+# expect: vendor-json: json=true +json=true application/json=false
+# expect: multipart: multipart/form-data=true multipart/*=true multipart=true form-data=true MULTIPART/FORM-DATA=true boundary=false urlencoded=false multipart/mixed=false
+# expect: urlencoded: urlencoded=true x-www-form-urlencoded=true application/x-www-form-urlencoded=true form=false json=false
+# expect: html: html=true text=true text/*=true text/html=true text/plain=false xml=false
+# expect: upper-header: html=true text/html=true
+# expect: spaced-header: text/plain=true plain=true
+# expect: svg: xml=true image=true image/*=true svg=false
+# expect: xml: xml=true application/xml=true json=false
+# expect: no-header: json=false */*=false =false
+# expect: empty-header: json=false */*=false
+# expect: malformed-header: garbage=false */*=false
+# expect: half-header: text=false text/*=false
+# expect: wildcard-header: json=false */*=false
+# expect: empty-pattern: =false
+# expect: star-pattern: *=true
+# expect: http: application/json=true json=true multipart=false
+# expect: http-multipart: multipart/form-data=true form-data=true json=false
+
+from @lam/vulture import InjectResponse, Request, Response, Server
+
+func check(req: Request, _res: Response) -> str {
+    out: list[str] = []
+    for pattern in req.header("X-Types").split("|") {
+        out.append(f"{pattern}={req.is_(pattern)}")
+    }
+    return " ".join(out)
+}
+
+func main() {
+    srv: Server = Server()
+    srv.post("/is", check)
+
+    func probe(label: str, contentType: str, patterns: str, withHeader: bool = true) {
+        headers: dict[str, str] = {"X-Types": patterns}
+        if withHeader {
+            headers["Content-Type"] = contentType
+        }
+        r: InjectResponse = srv.inject("POST", "/is", "{}", headers)
+        print(f"{label}: {r.body}")
+    }
+
+    probe("json-charset", "application/json; charset=utf-8", "json|application/json|APPLICATION/JSON|application/*|*/*|*/json|application/json; charset=utf-8|html|text/*|+json|charset|utf-8")
+    probe("problem-json", "application/problem+json", "json|+json|application/*+json|*/*+json|application/problem+json|application/json|problem")
+    probe("vendor-json", "application/vnd.api+json; ext=bulk", "json|+json|application/json")
+    probe("multipart", "multipart/form-data; boundary=XyZ", "multipart/form-data|multipart/*|multipart|form-data|MULTIPART/FORM-DATA|boundary|urlencoded|multipart/mixed")
+    probe("urlencoded", "application/x-www-form-urlencoded", "urlencoded|x-www-form-urlencoded|application/x-www-form-urlencoded|form|json")
+    probe("html", "text/html; charset=utf-8", "html|text|text/*|text/html|text/plain|xml")
+    probe("upper-header", "TEXT/HTML; Charset=UTF-8", "html|text/html")
+    probe("spaced-header", "  text/plain  ", "text/plain|plain")
+    probe("svg", "image/svg+xml", "xml|image|image/*|svg")
+    probe("xml", "application/xml", "xml|application/xml|json")
+    probe("no-header", "", "json|*/*|", false)
+    probe("empty-header", "", "json|*/*")
+    probe("malformed-header", "garbage", "garbage|*/*")
+    probe("half-header", "text/", "text|text/*")
+    probe("wildcard-header", "*/*", "json|*/*")
+    probe("empty-pattern", "application/json", "")
+    probe("star-pattern", "application/json", "*")
+
+    _ = srv.listenBackground(0).unwrap()
+    go! {
+        base := "http://" + srv.BoundAddr
+        defer srv.Shutdown(5000)
+        call := func(contentType string, patterns string) string {
+            request, _ := http.NewRequest("POST", base+"/is", strings.NewReader("{}"))
+            request.Header.Set("Content-Type", contentType)
+            request.Header.Set("X-Types", patterns)
+            resp, err := http.DefaultClient.Do(request)
+            if err != nil {
+                return err.Error()
+            }
+            defer resp.Body.Close()
+            data, _ := io.ReadAll(resp.Body)
+            return string(data)
+        }
+        fmt.Printf("http: %s\n", call("application/json", "application/json|json|multipart"))
+        fmt.Printf("http-multipart: %s\n", call("multipart/form-data; boundary=abc", "multipart/form-data|form-data|json"))
+    }
+}
+
+go! {
+    import (
+        "fmt"
+        "io"
+        "net/http"
+        "strings"
+    )
+}

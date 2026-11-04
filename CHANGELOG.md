@@ -2,6 +2,58 @@
 
 All notable changes to `@lam/vulture` are documented here.
 
+## [3.4.1] - 2026-11-04
+
+Requires `lamc` 4.2 (`lamlib.toml`: `lamc = ">=4.2, <5"`).
+
+### Changed
+
+- `req.formField(name, fallback)` also reads
+  `application/x-www-form-urlencoded` bodies, like `formValues` /
+  `formFieldNames` / `formFields`: the first value of a repeated key,
+  decoded, `""` for an empty value, `fallback` when absent. It read
+  multipart bodies only and gave `fallback` for every urlencoded field. All
+  four share one parsed, cached form; `streamBody` routes still have no
+  fields.
+- `req.is_(type)` matches the media type of `Content-Type` instead of
+  searching `type` anywhere in the header: parameters are ignored,
+  comparisons are case-insensitive, `type/subtype` patterns match exactly
+  or with `*` (`multipart/*`, `*/*`, `*`, `application/*+json`, `+json`), a
+  bare word matches the type, the subtype or the `+suffix` (`json` covers
+  `application/problem+json`; `multipart`, `html`, `form-data`,
+  `x-www-form-urlencoded` keep matching), and `urlencoded` is
+  `application/x-www-form-urlencoded`. Odd inputs answer differently:
+  fragments of the header (`is_("form")`, `"charset"`, `"boundary"`,
+  `"problem"` for `application/problem+json`, `"svg"` for `image/svg+xml`)
+  and an empty `type` no longer match; `multipart/*`, `text/*`, `*/*` and
+  `application/*+json` now do; a malformed (`garbage`, `text/`) or wildcard
+  (`*/*`) Content-Type matches nothing.
+- `res.problem(p)` renders `json(p)` (lamc 4.2 runs a subclass's `__json__`
+  for a `Problem`-typed value); the probe of the compiler's generated
+  `_lamDyn` view that worked around lamc 4.1 is gone.
+
+### Fixed
+
+- The `Allow` header of a 405 left out `HEAD` although GET routes answer
+  HEAD (3.1.0): a GET-only path answered `Allow: GET`, now `GET, HEAD`
+  (sorted, once with an explicit HEAD route; also in the problem document's
+  detail). Paths without a GET route are unchanged.
+- A `Problem` subclass thrown as a `Problem`-typed value (`throw make()`
+  with `func make() -> Problem` returning the subclass) was rendered with
+  the base `__json__`.
+
+### Documentation
+
+- README: `lamc` 4.2 requirement, "Request media type" section (`is_`
+  patterns), `formField` in "Form fields", the 405 `Allow` header; examples
+  drop the `_ =` before `Response` builder calls (lamc 4.2 no longer warns).
+- Tests: the 3.4 cross-feature test uses what lamc 4.2 fixed (inherited
+  fields in a subclass `__json__`, a nested function with default
+  parameters, `func languages` next to `const Languages`, a comprehension in
+  an f-string); the runner requires lamc 4.2.0.
+- `__init__.lam` passes `lamc fmt --check` (continuation lines of two
+  signatures).
+
 ## [3.4.0] - 2026-11-04
 
 ### Added

@@ -27,7 +27,7 @@
 # expect: stream body: streamed!
 # expect: 404 status: 404
 # expect: 405 status: 405
-# expect: 405 allow: GET
+# expect: 405 allow: GET, HEAD
 
 from @lam/vulture import Server, Request, Response, InjectResponse
 from lamerrors import Result
