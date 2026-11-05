@@ -27,7 +27,7 @@ lamc install https://github.com/thallium-solutions/lam-vulture.git
 Install the registry release:
 
 ```bash
-lamc install @lam/vulture@3.4.1
+lamc install @lam/vulture@3.4.2
 ```
 
 Install a local checkout during development:
@@ -558,8 +558,8 @@ func main() {
 
 The slots are `body`, `querystring` (or `query`), `params`, `headers`,
 `response` (keyed by status: `"200"`, `"2xx"`, `"default"`) and
-`multipartJson` (keyed by multipart field; see
-[Multipart JSON fields](#multipart-json-fields)). The slot map and
+`multipartJson` (keyed by multipart field), with `multipartJsonOptional`
+(see [Multipart JSON fields](#multipart-json-fields)). The slot map and
 every schema may be a native `json` object, a `dict` or JSON text;
 `withSchema` refuses anything else at once — a `json` array or scalar, a
 number, malformed JSON — with `SchemaTypeError` / `SchemaParseError` (YAML and
@@ -618,7 +618,8 @@ request each named field — its first value — is decoded as JSON and
 validated before the `preHandler` hooks, with shared `$ref` fragments
 resolved as for body schemas; the `body` schema is skipped (the body is
 not JSON). Requests of other content types keep the `body` schema. An
-absent field is a `required` issue, malformed JSON a `parse` issue.
+absent field is a `required` issue (unless it is
+[optional](#optional-multipart-json-fields)), malformed JSON a `parse` issue.
 Failures go through the issue handler, the formatter or the default
 answer with `where == "multipart"`: `SchemaIssue.part` is the field
 (`"data"`) and `SchemaIssue.field` the path inside its document
@@ -632,6 +633,55 @@ fields as `multipart/form-data` properties with an `application/json`
 encoding. A field name that is empty or a schema that is not an object
 raises `SchemaTypeError` / `SchemaParseError`; a `$ref` cycle raises
 `SchemaRefCycleError` at registration.
+
+#### Optional multipart JSON fields
+
+A field is required unless the route says otherwise (since 3.4.2). For
+an upload that may send only files — a `PATCH` that replaces a photo
+without touching the metadata — make the JSON part optional:
+
+```lammergeier
+# One field, with the method:
+app.patch("/products/:id", updateProduct, RouteOptions().multipartJsonSchema("data", product, false))
+
+# Or in the schema map: the fields of `multipartJson` listed here may be absent.
+schema: json = {"multipartJson": {"data": product, "meta": meta}, "multipartJsonOptional": ["data"]}
+app.patch("/products/:id", updateProduct, RouteOptions().withSchema(schema))
+```
+
+With `required = false` (`multipartJsonSchema(field, schema, required:
+bool = true)`) or the field listed in `multipartJsonOptional`:
+
+- an **absent** field (no part with that name) skips the validation of
+  that field altogether; it is not replaced by `{}` or `null`, and the
+  handler sees it absent: `req.formField("data", fallback)` gives
+  `fallback`;
+- a **present** field that is empty (`""`, blanks) or not JSON is still a
+  `parse` issue — sending the part means sending a document;
+- a **present** field is validated against its schema as before (shared
+  `$ref`, issues, handler, formatter, problem details unchanged).
+
+The other fields of the route keep their own requiredness (`data`
+optional and `meta` required is fine). The plain form
+`"multipartJson": {"data": schema}` keeps meaning "required", so 3.4.0 /
+3.4.1 schemas behave the same. `multipartJsonOptional` is a list of
+strings naming fields of the same map's `multipartJson` slot; anything
+else (not a list, a non-string item, an unknown field such as a typo, no
+`multipartJson` slot) raises `SchemaTypeError` in `withSchema`. A
+`multipartJsonSchema` call wins over the slot for its field, requiredness
+included: `withSchema` listing `data` as optional followed by
+`multipartJsonSchema("data", s)` makes it required again. `openapi()`
+leaves optional fields out of the multipart schema's `required` list (and
+writes no `required` list when every field is optional).
+
+The optional marker is a sibling list rather than a wrapper around the
+schema (`{"data": {"schema": ..., "required": false}}` or
+`{"data": {"$optional": ...}}`) because every value under `multipartJson`
+is a JSON Schema, in which `required`, `schema` or a `$`-keyword can
+legitimately appear: a wrapper could not be told from a schema. A list
+next to the map mirrors JSON Schema's and OpenAPI's own `required`
+lists, and a server older than 3.4.2 ignores the unknown slot and keeps
+the field required (strict, never laxer).
 
 ### Shared schemas
 

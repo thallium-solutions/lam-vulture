@@ -1,0 +1,343 @@
+# Test: optional multipart JSON fields (3.4.2).
+#
+# RouteOptions.multipartJsonSchema(field, schema, required = false) and the
+# withSchema slot "multipartJsonOptional": [field, ...] (naming fields of the
+# "multipartJson" slot) make a multipart JSON field optional: an absent field
+# skips that part's validation (handlers see req.formField(name, fallback)
+# return the fallback); a present field that is empty or not JSON is still a
+# `parse` issue; a present field is validated against its schema as before.
+# Plain multipartJson schemas keep meaning "required". The method wins over
+# the slot for its field (schema and requiredness). openapi() leaves optional
+# fields out of the multipart schema's `required` list (no list when every
+# field is optional).
+#
+# expect: absent: 200 data=<absent> photos=1
+# expect: absent-no-parts: 200 data=<absent> photos=0
+# expect: present-valid: 200 data={"name": "Bag", "price": 2} photos=1
+# expect: present-invalid: 400 multipart data/price:minimum
+# expect: present-empty: 400 multipart data/:parse
+# expect: present-blank: 400 multipart data/:parse
+# expect: present-malformed: 400 multipart data/:parse
+# expect: present-not-object: 400 multipart data/:type
+# expect: required-default: 400 multipart data/:required
+# expect: required-explicit: 400 multipart data/:required
+# expect: slot-absent: 200 data=<absent> photos=1
+# expect: slot-invalid: 400 multipart data/name:required
+# expect: slot-required-other: 400 multipart meta/:required
+# expect: method-wins-required: 400 multipart data/:required
+# expect: method-wins-optional: 200 data=<absent> photos=0
+# expect: two-none: 400 multipart data/:required
+# expect: two-data-only: 200
+# expect: two-meta-invalid: 400 multipart meta/:type
+# expect: two-both-invalid: 400 multipart data/price:minimum meta/:type
+# expect: shared-ref-absent: 200
+# expect: shared-ref-invalid: 400 multipart data/owner:pattern
+# expect: shared-ref-nested: 400 multipart data/tags.1:maxLength
+# expect: json-body-unchanged: 400 body /price:minimum
+# expect: handler-absent: 200 calls=0
+# expect: handler-invalid: 400 calls=1 multipart data price minimum
+# expect: handler-empty: 400 calls=2 multipart data  parse
+# expect: problem-absent: 200 data=<absent> photos=1
+# expect: problem-empty: 400 application/problem+json multipart data parse
+# expect: problem-invalid: 400 application/problem+json multipart data price minimum
+# expect: default-envelope-absent: 200
+# expect: default-envelope-empty: 400 validation failed: multipart
+# expect: stream-absent: 200 ok
+# expect: stream-invalid: 400 multipart data/price:minimum
+# expect: openapi-two: data | data meta
+# expect: openapi-all-optional: required=absent data
+# expect: openapi-required-route: data
+# expect: bad-optional-type: SchemaTypeError
+# expect: bad-optional-entry: SchemaTypeError
+# expect: bad-optional-unknown: SchemaTypeError
+# expect: bad-optional-no-slot: SchemaTypeError
+# expect: http-absent: 200 data=<absent> photos=2
+# expect: http-invalid: 400 multipart data/price:minimum
+# expect: http-valid: 200 data={"name": "Bag", "price": 3} photos=1
+
+from lamjson import Json
+from lamerrors import Result
+from @lam/vulture import InjectResponse, Request, Response, RouteOptions, SchemaIssue, Server
+
+const Boundary: str = "LamVultureBoundary"
+
+func textPart(name: str, value: str) -> str {
+    return f"--{Boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+}
+
+func filePart(name: str, filename: str, content: str) -> str {
+    return f"--{Boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: image/png\r\n\r\n{content}\r\n"
+}
+
+func closing() -> str {
+    return f"--{Boundary}--\r\n"
+}
+
+func multipartHeaders() -> dict[str, str] {
+    return {"Content-Type": f"multipart/form-data; boundary={Boundary}"}
+}
+
+func productSchema() -> json {
+    return {
+        "type": "object",
+        "required": ["name", "price"],
+        "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "price": {"$ref": "money"},
+            "owner": {"$ref": "uuid"},
+            "tags": {"type": "array", "items": {"$ref": "tag"}},
+        },
+    }
+}
+
+func update(req: Request, _res: Response) -> str {
+    data: str = req.formField("data", "<absent>")
+    photos: int = len(req.formFiles("photo"))
+    return f"data={data} photos={photos}"
+}
+
+func ok(_req: Request, _res: Response) -> str {
+    return "ok"
+}
+
+func describe(issue: SchemaIssue) -> str {
+    return f"{issue.part}/{issue.field}:{issue.keyword}"
+}
+
+func record(where: str, issues: list[SchemaIssue], _req: Request, res: Response) {
+    parts: list[str] = [describe(issue) for issue in issues]
+    res.code(400).text(f"{where} {' '.join(parts)}")
+}
+
+func readBody(req: Request, _res: Response) {
+    if req.streamBody {
+        read: Result[str] = req.bodyReader().readAll()
+        if read.ok() {
+            req.body = read.unwrap()
+        }
+    }
+}
+
+func addShared(srv: Server) {
+    srv.addSchema({"$id": "money", "type": "number", "minimum": 0})
+    srv.addSchema({"$id": "uuid", "type": "string", "pattern": "^[0-9a-f-]{36}$"})
+    srv.addSchema({"$id": "tag", "type": "string", "maxLength": 5})
+}
+
+func makeServer() -> Server {
+    srv: Server = Server()
+    addShared(srv)
+    srv.patch("/items", update, RouteOptions().multipartJsonSchema("data", productSchema(), false))
+    srv.post("/required", update, RouteOptions().multipartJsonSchema("data", productSchema()))
+    srv.post("/required-explicit", update, RouteOptions().multipartJsonSchema("data", productSchema(), true))
+    slot: json = {
+        "body": productSchema(),
+        "multipartJson": {"data": productSchema(), "meta": {"type": "object"}},
+        "multipartJsonOptional": ["data"],
+    }
+    srv.patch("/slot", update, RouteOptions().withSchema(slot))
+    optionalSlot: json = {"multipartJson": {"data": productSchema()}, "multipartJsonOptional": ["data"]}
+    srv.patch("/method-wins-required", update, RouteOptions().withSchema(optionalSlot).multipartJsonSchema("data", productSchema()))
+    requiredSlot: json = {"multipartJson": {"data": productSchema()}}
+    srv.patch("/method-wins-optional", update, RouteOptions().withSchema(requiredSlot).multipartJsonSchema("data", productSchema(), false))
+    two: RouteOptions = RouteOptions().multipartJsonSchema("data", productSchema()).multipartJsonSchema("meta", {"type": "object"}, false)
+    srv.patch("/two", ok, two)
+    stream: RouteOptions = RouteOptions(0, 0, true).multipartJsonSchema("data", productSchema(), false)
+    srv.patch("/stream", ok, stream.preValidation(readBody))
+    return srv
+}
+
+func formSchema(spec: json, path: str, method: str) -> json {
+    return spec["paths"][path][method]["requestBody"]["content"]["multipart/form-data"]["schema"]
+}
+
+func names(value: json) -> str {
+    items: list[str] = []
+    for item in Json.toList(value).unwrap() {
+        items.append(str(item))
+    }
+    return " ".join(items)
+}
+
+func keysOf(value: json) -> str {
+    keys: list[str] = [key for key in Json.toDict(value).unwrap()]
+    return " ".join(keys.sort())
+}
+
+func expectError(label: str, action: func()) {
+    try {
+        action()
+        print(f"{label}: no error")
+    } catch err {
+        text: str = str(err)
+        print(f"{label}: {text.split(':')[0]}")
+    }
+}
+
+func main() {
+    srv: Server = makeServer()
+    srv.setSchemaIssueHandler(record)
+    headers: dict[str, str] = multipartHeaders()
+    func send(path: str, body: str) -> InjectResponse {
+        return srv.inject("PATCH", path, body, headers)
+    }
+    func show(label: str, r: InjectResponse) {
+        print(f"{label}: {r.status} {r.body}")
+    }
+    photo: str = filePart("photo", "a.png", "PNG")
+    validData: str = "{\"name\": \"Bag\", \"price\": 2}"
+
+    show("absent", send("/items", photo + closing()))
+    show("absent-no-parts", send("/items", textPart("note", "x") + closing()))
+    show("present-valid", send("/items", textPart("data", validData) + photo + closing()))
+    show("present-invalid", send("/items", textPart("data", "{\"name\": \"Bag\", \"price\": -1}") + photo + closing()))
+    show("present-empty", send("/items", textPart("data", "") + photo + closing()))
+    show("present-blank", send("/items", textPart("data", "   ") + closing()))
+    show("present-malformed", send("/items", textPart("data", "{name") + closing()))
+    show("present-not-object", send("/items", textPart("data", "[1]") + closing()))
+    show("required-default", srv.inject("POST", "/required", photo + closing(), headers))
+    show("required-explicit", srv.inject("POST", "/required-explicit", photo + closing(), headers))
+
+    show("slot-absent", send("/slot", textPart("meta", "{}") + photo + closing()))
+    show("slot-invalid", send("/slot", textPart("data", "{\"price\": 1}") + textPart("meta", "{}") + closing()))
+    show("slot-required-other", send("/slot", photo + closing()))
+    show("method-wins-required", send("/method-wins-required", photo + closing()))
+    show("method-wins-optional", send("/method-wins-optional", closing()))
+
+    show("two-none", send("/two", photo + closing()))
+    print(f"two-data-only: {send('/two', textPart('data', validData) + closing()).status}")
+    r: InjectResponse = send("/two", textPart("data", validData) + textPart("meta", "[1]") + closing())
+    show("two-meta-invalid", r)
+    r = send("/two", textPart("data", "{\"name\": \"Bag\", \"price\": -1}") + textPart("meta", "3") + closing())
+    show("two-both-invalid", r)
+
+    print(f"shared-ref-absent: {send('/items', photo + closing()).status}")
+    owner: str = "{\"name\": \"Bag\", \"price\": 1, \"owner\": \"nope\"}"
+    show("shared-ref-invalid", send("/items", textPart("data", owner) + closing()))
+    tags: str = "{\"name\": \"Bag\", \"price\": 1, \"tags\": [\"ok\", \"too-long\"]}"
+    show("shared-ref-nested", send("/items", textPart("data", tags) + closing()))
+
+    jsonHeaders: dict[str, str] = {"Content-Type": "application/json"}
+    r = srv.inject("PATCH", "/slot", "{\"name\": \"Bag\", \"price\": -3}", jsonHeaders)
+    show("json-body-unchanged", r)
+
+    calls: list[str] = []
+    probe: Server = makeServer()
+    func capture(where: str, issues: list[SchemaIssue], _req: Request, res: Response) {
+        first: SchemaIssue = issues[0]
+        calls.append(f"{where} {first.part} {first.field} {first.keyword}")
+        res.code(400).text("captured")
+    }
+    probe.setSchemaIssueHandler(capture)
+    r = probe.inject("PATCH", "/items", photo + closing(), headers)
+    print(f"handler-absent: {r.status} calls={len(calls)}")
+    r = probe.inject("PATCH", "/items", textPart("data", "{\"name\": \"Bag\", \"price\": -1}") + closing(), headers)
+    print(f"handler-invalid: {r.status} calls={len(calls)} {calls[0]}")
+    r = probe.inject("PATCH", "/items", textPart("data", "") + closing(), headers)
+    print(f"handler-empty: {r.status} calls={len(calls)} {calls[1]}")
+
+    problems: Server = makeServer()
+    problems.useProblemDetails()
+    show("problem-absent", problems.inject("PATCH", "/items", photo + closing(), headers))
+    func problemLine(label: str, r: InjectResponse, withField: bool) {
+        doc: json = Json.decode(r.body).unwrap()
+        where: str = doc["in"]
+        part: str = doc["errors"][0]["part"]
+        field: str = doc["errors"][0]["field"]
+        keyword: str = doc["errors"][0]["keyword"]
+        if withField {
+            print(f"{label}: {r.status} {r.header('Content-Type')} {where} {part} {field} {keyword}")
+        } else {
+            print(f"{label}: {r.status} {r.header('Content-Type')} {where} {part} {keyword}")
+        }
+    }
+    problemLine("problem-empty", problems.inject("PATCH", "/items", textPart("data", "") + closing(), headers), false)
+    r = problems.inject("PATCH", "/items", textPart("data", "{\"name\": \"Bag\", \"price\": -1}") + closing(), headers)
+    problemLine("problem-invalid", r, true)
+
+    plain: Server = makeServer()
+    print(f"default-envelope-absent: {plain.inject('PATCH', '/items', photo + closing(), headers).status}")
+    r = plain.inject("PATCH", "/items", textPart("data", "") + closing(), headers)
+    envelope: json = Json.decode(r.body).unwrap()
+    message: str = envelope["message"]
+    print(f"default-envelope-empty: {r.status} {message}")
+
+    show("stream-absent", send("/stream", photo + closing()))
+    show("stream-invalid", send("/stream", textPart("data", "{\"name\": \"Bag\", \"price\": -1}") + closing()))
+
+    spec: json = Json.decode(srv.openapi()).unwrap()
+    twoSchema: json = formSchema(spec, "/two", "patch")
+    print(f"openapi-two: {names(twoSchema['required'])} | {keysOf(twoSchema['properties'])}")
+    itemsSchema: json = formSchema(spec, "/items", "patch")
+    hasRequired: str = "absent"
+    if "required" in Json.toDict(itemsSchema).unwrap() {
+        hasRequired = "present"
+    }
+    print(f"openapi-all-optional: required={hasRequired} {keysOf(itemsSchema['properties'])}")
+    requiredSchema: json = formSchema(spec, "/required", "post")
+    print(f"openapi-required-route: {names(requiredSchema['required'])}")
+
+    func badType() {
+        _ = RouteOptions().withSchema({"multipartJson": {"data": {"type": "object"}}, "multipartJsonOptional": "data"})
+    }
+    expectError("bad-optional-type", badType)
+    func badEntry() {
+        _ = RouteOptions().withSchema({"multipartJson": {"data": {"type": "object"}}, "multipartJsonOptional": [1]})
+    }
+    expectError("bad-optional-entry", badEntry)
+    func badUnknown() {
+        _ = RouteOptions().withSchema({"multipartJson": {"data": {"type": "object"}}, "multipartJsonOptional": ["dta"]})
+    }
+    expectError("bad-optional-unknown", badUnknown)
+    func badNoSlot() {
+        _ = RouteOptions().withSchema({"body": {"type": "object"}, "multipartJsonOptional": ["data"]})
+    }
+    expectError("bad-optional-no-slot", badNoSlot)
+
+    _ = srv.listenBackground(0).unwrap()
+    address: str = srv.boundAddr
+    lines: list[str] = []
+    go! {
+        patch := func(data string, withData bool, files int) string {
+            var buf bytes.Buffer
+            w := multipart.NewWriter(&buf)
+            if withData {
+                _ = w.WriteField("data", data)
+            }
+            for i := 0; i < files; i++ {
+                fw, _ := w.CreateFormFile("photo", fmt.Sprintf("p%d.png", i))
+                _, _ = fw.Write([]byte("PNG"))
+            }
+            w.Close()
+            req, err := http.NewRequest(http.MethodPatch, "http://"+address+"/items", &buf)
+            if err != nil {
+                return err.Error()
+            }
+            req.Header.Set("Content-Type", w.FormDataContentType())
+            resp, err := http.DefaultClient.Do(req)
+            if err != nil {
+                return err.Error()
+            }
+            body, _ := io.ReadAll(resp.Body)
+            resp.Body.Close()
+            return fmt.Sprintf("%d %s", resp.StatusCode, string(body))
+        }
+        lines = append(lines, "http-absent: "+patch("", false, 2))
+        lines = append(lines, "http-invalid: "+patch(`{"name": "Bag", "price": -2}`, true, 1))
+        lines = append(lines, "http-valid: "+patch(`{"name": "Bag", "price": 3}`, true, 1))
+    }
+    srv.close()
+    for line in lines {
+        print(line)
+    }
+}
+
+go! {
+    import (
+        "bytes"
+        "fmt"
+        "io"
+        "mime/multipart"
+        "net/http"
+    )
+}

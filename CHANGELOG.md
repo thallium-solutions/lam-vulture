@@ -2,6 +2,39 @@
 
 All notable changes to `@lam/vulture` are documented here.
 
+## [3.4.2] - 2026-11-05
+
+### Added
+
+- Optional multipart JSON fields, for uploads that may send only files (a
+  `PATCH` that replaces a photo):
+  `RouteOptions.multipartJsonSchema(field, schema, required: bool = true)`
+  and, in `withSchema`, a `"multipartJsonOptional": ["data", ...]` list
+  next to `"multipartJson"`. An optional field that is absent skips its
+  validation entirely (not validated as `{}` or `null`;
+  `req.formField(name, fallback)` gives `fallback`); a present field that
+  is empty or not JSON is still a `parse` issue; a present field is
+  validated against its schema as before. A plain
+  `"multipartJson": {"data": schema}` keeps meaning required, so 3.4.0 /
+  3.4.1 routes are unchanged. The list must hold strings naming fields of
+  the same map's `multipartJson` slot (else `SchemaTypeError`); a
+  `multipartJsonSchema` call wins over the slot for its field, requiredness
+  included. A sibling list was chosen over a wrapper
+  (`{"data": {"schema": ..., "required": false}}`, `{"$optional": ...}`)
+  because a wrapper cannot be told apart from a JSON Schema using those
+  keys. `openapi()` leaves optional fields out of the multipart schema's
+  `required` list and omits the list when every field is optional
+  (OpenAPI 3.0 refuses an empty one).
+
+### Documentation
+
+- README: "Optional multipart JSON fields" under "Multipart JSON fields";
+  install line 3.4.2.
+- Tests: `test_multipart_json_optional.lam` (absent / empty / malformed /
+  invalid / valid parts, slot and method forms and their precedence, two
+  fields with one optional, shared `$ref`, issue handler, problem details,
+  default envelope, `streamBody`, OpenAPI, slot errors, real HTTP `PATCH`).
+
 ## [3.4.1] - 2026-11-04
 
 Requires `lamc` 4.2 (`lamlib.toml`: `lamc = ">=4.2, <5"`).

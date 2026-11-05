@@ -130,6 +130,9 @@ go! {
         // Multipart text field -> JSON Schema text of its JSON document
         // (“multipartJson“ slot / “RouteOptions.multipartJsonSchema“).
         MultipartJsonSchemas map[string]string
+        // Fields of “MultipartJsonSchemas“ that may be absent
+        // (“multipartJsonOptional“ slot / “required = false“).
+        MultipartJsonOptional map[string]bool
         // Misc metadata that surfaces in “listRoutes“ and the
         // OpenAPI generator.
         OperationId string
@@ -230,6 +233,16 @@ go! {
                         out.MultipartJsonSchemas = map[string]string{}
                     }
                     out.MultipartJsonSchemas[field] = string(text)
+                    // The method wins over the slot for its field,
+                    // requiredness included.
+                    if required, ok := typed.MultipartJsonRequired[field]; ok && !required {
+                        if out.MultipartJsonOptional == nil {
+                            out.MultipartJsonOptional = map[string]bool{}
+                        }
+                        out.MultipartJsonOptional[field] = true
+                    } else {
+                        delete(out.MultipartJsonOptional, field)
+                    }
                 }
             }
             return out
@@ -390,6 +403,13 @@ go! {
                     for field, sub := range fm {
                         out.MultipartJsonSchemas[field] = toText(sub)
                     }
+                }
+            case "multipartjsonoptional":
+                for _, field := range lamSchemaFieldList(v) {
+                    if out.MultipartJsonOptional == nil {
+                        out.MultipartJsonOptional = map[string]bool{}
+                    }
+                    out.MultipartJsonOptional[field] = true
                 }
             }
         }
@@ -1170,9 +1190,64 @@ go! {
                         return nil, err
                     }
                 }
+            case "multipartjsonoptional":
+                if err := lamCheckMultipartOptional(obj, value); err != nil {
+                    return nil, err
+                }
             }
         }
         return obj, nil
+    }
+
+    // lamSchemaFieldList reads the field names of the
+    // “multipartJsonOptional“ slot (a list of strings).
+    func lamSchemaFieldList(value interface{}) []string {
+        out := []string{}
+        switch list := value.(type) {
+        case []string:
+            out = append(out, list...)
+        case []interface{}:
+            for _, item := range list {
+                if s, ok := item.(string); ok {
+                    out = append(out, s)
+                }
+            }
+        }
+        return out
+    }
+
+    // lamCheckMultipartOptional validates the “multipartJsonOptional“
+    // slot of a schema map: a list of strings, each naming a field of
+    // the map's own “multipartJson“ slot (a typo would otherwise leave
+    // the field required without a word).
+    func lamCheckMultipartOptional(slots map[string]interface{}, value interface{}) error {
+        var items []interface{}
+        switch list := value.(type) {
+        case []interface{}:
+            items = list
+        case []string:
+            for _, s := range list {
+                items = append(items, s)
+            }
+        default:
+            return fmt.Errorf("SchemaTypeError: multipartJsonOptional must be a list of multipart field names, got %s", lamSchemaKind(value))
+        }
+        var fields map[string]interface{}
+        for key, sub := range slots {
+            if strings.ToLower(key) == "multipartjson" {
+                fields, _ = sub.(map[string]interface{})
+            }
+        }
+        for _, item := range items {
+            field, ok := item.(string)
+            if !ok {
+                return fmt.Errorf("SchemaTypeError: multipartJsonOptional must be a list of multipart field names, got an item of type %s", lamSchemaKind(item))
+            }
+            if _, exists := fields[field]; !exists {
+                return fmt.Errorf("SchemaTypeError: multipartJsonOptional names %q, which is not a field of the multipartJson slot", field)
+            }
+        }
+        return nil
     }
 
     // lamCheckRouteSchemaRefs refuses, at route registration, a route
@@ -4123,6 +4198,9 @@ class RouteOptions {
         # Multipart field -> JSON Schema (normalized object) set with
         # ``multipartJsonSchema``; merged over the ``multipartJson`` slot.
         self.multipartJson: dict[str, any] = {}
+        # Multipart field -> its ``required`` argument of
+        # ``multipartJsonSchema`` (wins over ``multipartJsonOptional``).
+        self.multipartJsonRequired: dict[str, bool] = {}
         self.summary: str = ""
         self.description: str = ""
         self.operationId: str = ""
@@ -4148,7 +4226,9 @@ class RouteOptions {
         #- Attach the Fastify-style schema map: ``body``, ``querystring``
         (or ``query``), ``params``, ``headers``, ``response`` (keyed by
         status) and ``multipartJson`` (keyed by multipart field: see
-        ``multipartJsonSchema``). The map and each schema may be a native ``json`` object, a
+        ``multipartJsonSchema``), with ``multipartJsonOptional`` (a list of
+        ``multipartJson`` fields that may be absent; the others are
+        required). The map and each schema may be a native ``json`` object, a
         ``dict`` or JSON text (a YAML / XML ``body`` schema is text, with
         ``format`` ``"yaml"`` / ``"xml"``). Anything else — a non-object
         ``json`` value, a number, malformed JSON text — raises
@@ -4169,19 +4249,22 @@ class RouteOptions {
         return self
     }
 
-    func multipartJsonSchema(self, field: str, schema: any) -> RouteOptions {
+    func multipartJsonSchema(self, field: str, schema: any, required: bool = true) -> RouteOptions {
         #- Validate the multipart/form-data text field ``field``, decoded as
         JSON, against ``schema`` (a ``json`` object, a ``dict`` or JSON
         text; shared ``$ref`` ids resolved like body schemas) before the
         ``preHandler`` hooks, on multipart requests only: they skip the
         ``body`` schema, which keeps validating JSON requests. An absent
-        field is a ``required`` issue, malformed JSON a ``parse`` one.
-        Failures are reported with ``where == "multipart"``,
-        ``SchemaIssue.part == field`` and ``SchemaIssue.field`` the path in
-        the document. Same as the ``multipartJson`` slot of ``withSchema``
-        (this method wins for the same field). A field name that is empty or
-        a schema that is not an object raises ``SchemaTypeError`` /
-        ``SchemaParseError``. -#
+        field is a ``required`` issue — or, with ``required = false``, skips
+        the validation of that field (``req.formField(field, fallback)``
+        gives ``fallback``). A present field that is empty or not JSON is a
+        ``parse`` issue either way. Failures are reported with
+        ``where == "multipart"``, ``SchemaIssue.part == field`` and
+        ``SchemaIssue.field`` the path in the document. Same as the
+        ``multipartJson`` / ``multipartJsonOptional`` slots of ``withSchema``
+        (this method wins for the same field, requiredness included). A
+        field name that is empty or a schema that is not an object raises
+        ``SchemaTypeError`` / ``SchemaParseError``. -#
         normalized: any = None
         go! {
             if strings.TrimSpace(field) == "" {
@@ -4194,6 +4277,7 @@ class RouteOptions {
             normalized = obj
         }
         self.multipartJson[field] = normalized
+        self.multipartJsonRequired[field] = required
         return self
     }
 
@@ -5757,7 +5841,17 @@ class Server {
                             }
                             props[field] = schema
                             encoding[field] = map[string]interface{}{"contentType": "application/json"}
-                            required = append(required, field)
+                            if !route.opts.MultipartJsonOptional[field] {
+                                required = append(required, field)
+                            }
+                        }
+                        formSchema := map[string]interface{}{
+                            "type":       "object",
+                            "properties": props,
+                        }
+                        if len(required) > 0 {
+                            // OpenAPI 3.0 refuses an empty list.
+                            formSchema["required"] = required
                         }
                         body, _ := op["requestBody"].(map[string]interface{})
                         if body == nil {
@@ -5770,11 +5864,7 @@ class Server {
                             body["content"] = content
                         }
                         content["multipart/form-data"] = map[string]interface{}{
-                            "schema": map[string]interface{}{
-                                "type":       "object",
-                                "required":   required,
-                                "properties": props,
-                            },
+                            "schema":   formSchema,
                             "encoding": encoding,
                         }
                     }
@@ -6235,11 +6325,12 @@ go! {
 
     // lamValidateMultipartJson validates the JSON documents of the
     // multipart text fields named by “schemas“ (fields in name order,
-    // first value of each): an absent field is a “required“ issue,
-    // malformed JSON a “parse“ one; issues carry the field in “Part“.
+    // first value of each): an absent field is a “required“ issue
+    // unless “optional“ names it (then it is skipped), an empty or
+    // malformed value a “parse“ one; issues carry the field in “Part“.
     // A schema still referencing a shared id not registered yet is not
     // checked (as body schemas).
-    func lamValidateMultipartJson(srv *Server, req *Request, res *Response, schemas map[string]string) {
+    func lamValidateMultipartJson(srv *Server, req *Request, res *Response, schemas map[string]string, optional map[string]bool) {
         issues := []*SchemaIssue{}
         errs := []string{}
         ct := lamReadHeader(req, "Content-Type")
@@ -6263,6 +6354,9 @@ go! {
         for _, field := range fields {
             values := form.Fields[field]
             if len(values) == 0 {
+                if optional[field] {
+                    continue
+                }
                 message := fmt.Sprintf("the multipart field %q is required", field)
                 issues = append(issues, NewSchemaIssue("", "required", message, lamJSONWrapRaw(nil), false, field))
                 errs = append(errs, field+": "+message)
@@ -6678,7 +6772,7 @@ go! {
             multipartBody := len(opts.MultipartJsonSchemas) > 0 &&
                 lamContentTypeKey(lamReadHeader(req, "Content-Type")) == "multipart/form-data"
             if multipartBody {
-                lamValidateMultipartJson(srv, req, res, opts.MultipartJsonSchemas)
+                lamValidateMultipartJson(srv, req, res, opts.MultipartJsonSchemas, opts.MultipartJsonOptional)
             } else if opts.BodySchema != "" {
                 format := opts.SchemaFormat
                 if format == "" {
