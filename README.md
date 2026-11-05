@@ -27,7 +27,7 @@ lamc install https://github.com/thallium-solutions/lam-vulture.git
 Install the registry release:
 
 ```bash
-lamc install @lam/vulture@3.4.2
+lamc install @lam/vulture@3.5.0
 ```
 
 Install a local checkout during development:
@@ -636,7 +636,7 @@ raises `SchemaTypeError` / `SchemaParseError`; a `$ref` cycle raises
 
 #### Optional multipart JSON fields
 
-A field is required unless the route says otherwise (since 3.4.2). For
+A field is required unless the route says otherwise (since 3.5.0). For
 an upload that may send only files — a `PATCH` that replaces a photo
 without touching the metadata — make the JSON part optional:
 
@@ -680,7 +680,7 @@ schema (`{"data": {"schema": ..., "required": false}}` or
 is a JSON Schema, in which `required`, `schema` or a `$`-keyword can
 legitimately appear: a wrapper could not be told from a schema. A list
 next to the map mirrors JSON Schema's and OpenAPI's own `required`
-lists, and a server older than 3.4.2 ignores the unknown slot and keeps
+lists, and a server older than 3.5.0 ignores the unknown slot and keeps
 the field required (strict, never laxer).
 
 ### Shared schemas

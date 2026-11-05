@@ -2,6 +2,13 @@
 
 All notable changes to `@lam/vulture` are documented here.
 
+## [3.5.0] - 2026-11-05
+
+### Changed
+- Re-released 3.4.2 as a minor version: it adds API (optional multipart JSON
+  fields), and `lamc install` rightly refuses a patch release with new API.
+  The code is identical to 3.4.2; use 3.5.0.
+
 ## [3.4.2] - 2026-11-05
 
 ### Added
