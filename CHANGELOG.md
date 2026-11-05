@@ -2,6 +2,43 @@
 
 All notable changes to `@lam/vulture` are documented here.
 
+## [3.5.1] - 2026-11-05
+
+### Fixed
+
+- `req.cookie(name)` no longer fails for the whole `Cookie` header when one
+  pair is malformed. It used `http.ParseCookie`, which rejects the entire
+  header for a single bad pair, so one cookie with a JSON value
+  (`consent={"a":1,"b":2}`, set by another app on the same host) or other
+  invalid octets made every cookie unreadable, CSRF and session cookies
+  included (login was impossible). The header is now parsed like browsers and
+  Go's `http.Request.Cookies()` do: split on `;`, trim, cut the name at the
+  first `=`, strip one pair of surrounding quotes, and skip any pair whose
+  name is not a valid token or whose value holds `"`, `\`, control or
+  non-ASCII bytes. Valid pairs stay readable. When a name repeats, the first
+  pair wins (browsers send more specific paths first). An absent or skipped
+  cookie is `CookieNotFoundError`; `req.cookie` no longer returns
+  `CookieParseError`, including for a header with no valid pair, so "no
+  session" checks on `CookieNotFoundError` keep working.
+- `req.signedCookie` reads through the same lenient parser, so a signed
+  session cookie next to a malformed one verifies. Its error kinds are
+  unchanged: `CookieNotFoundError`, then `SignedCookieError`.
+- Over HTTP, several `Cookie` header lines are joined with `"; "` (as HTTP/2
+  does) instead of keeping only the first line, so `req.cookie` and
+  `req.header("Cookie")` see every pair. `inject` reads `Cookie` header keys
+  case-insensitively, `cookie` included.
+
+### Documentation
+
+- README: "Reading cookies" under "Version 2 failure and routing
+  conventions"; install line 3.5.1.
+- Tests: `test_request_cookie_lenient.lam` (JSON, quoted, unbalanced-quote,
+  spaced, comma, `=`-in-value, value-less, unicode and backslash pairs, empty
+  names and parts, duplicates, 300 cookies, header with no valid pair, no
+  header, lowercase key, signed cookie next to a malformed one, tampered and
+  missing signed cookies; the same over a real listener with raw and
+  repeated `Cookie` lines).
+
 ## [3.5.0] - 2026-11-05
 
 ### Changed

@@ -27,7 +27,7 @@ lamc install https://github.com/thallium-solutions/lam-vulture.git
 Install the registry release:
 
 ```bash
-lamc install @lam/vulture@3.5.0
+lamc install @lam/vulture@3.5.1
 ```
 
 Install a local checkout during development:
@@ -201,6 +201,25 @@ throwing/`try*` or sentinel-returning twins:
 - `Request.cookie`, `signedCookie`, `jsonBody`, and `parsedBody` return `Result`
   values. Missing, malformed, or signature-invalid data is never reported as an
   empty string, JSON null, or `None` sentinel.
+
+### Reading cookies
+
+`req.cookie(name)` parses the `Cookie` header leniently, the way browsers and
+Go's `http.Request.Cookies()` do: pairs are split on `;` and trimmed, the name
+ends at the first `=` (so `tok=a=b==` reads `a=b==`), one pair of surrounding
+double quotes is removed, and spaces and commas inside a value are kept. A pair
+with an invalid name token, or a value holding `"`, `\`, control or non-ASCII
+bytes, is **skipped**; every other pair stays readable. A malformed cookie set
+by another site or another localhost project (`consent={"a":1,"b":2}`) can
+therefore no longer hide your session or CSRF cookie. When a name repeats, the
+first pair wins (browsers send cookies with more specific paths first).
+Several `Cookie` header lines are read together, as are `Cookie` / `cookie`
+keys passed to `inject`.
+
+A cookie that is absent or was skipped is `CookieNotFoundError`. Since 3.5.1
+`req.cookie` never returns `CookieParseError` (before, one bad pair failed the
+whole header with it). `req.signedCookie(name, secret)` reads through the same
+parser and adds `SignedCookieError` for a bad signature.
 
 A GET route also answers HEAD (without a body). A path registered for other
 methods only answers 405 with an `Allow` header listing them sorted, `HEAD`

@@ -1,0 +1,199 @@
+# Test: Request.cookie / Request.signedCookie parse the Cookie header
+# leniently, like browsers and Go's http.Request.Cookies(): a malformed
+# pair (a JSON value set by another app, invalid octets, a bad name) is
+# skipped and every valid pair stays readable. Before 3.5.1 one bad pair
+# made the whole header a CookieParseError, so CSRF and session cookies
+# were unreadable (login impossible).
+#
+# Exercised through inject and through a real HTTP listener sending raw
+# Cookie headers (including two Cookie header lines).
+#
+# expect: json neighbour: ok:[abc]
+# expect: json cookie itself: err:CookieNotFoundError
+# expect: json first after: ok:[abc]
+# expect: quoted: ok:[hello world]
+# expect: quoted empty: ok:[]
+# expect: unbalanced quote skipped: err:CookieNotFoundError
+# expect: unbalanced quote neighbour: ok:[1]
+# expect: spaces around pairs: ok:[2]
+# expect: space inside value: ok:[hello world]
+# expect: commas in value: ok:[1,2,3]
+# expect: comma neighbour: ok:[x]
+# expect: empty name neighbour: ok:[1]
+# expect: empty parts neighbour: ok:[2]
+# expect: value-less pair: ok:[]
+# expect: equals in value: ok:[a=b==]
+# expect: unicode value skipped: err:CookieNotFoundError
+# expect: unicode value neighbour: ok:[1]
+# expect: unicode name neighbour: ok:[2]
+# expect: backslash value skipped: err:CookieNotFoundError
+# expect: duplicate names: ok:[first]
+# expect: many cookies: ok:[v151]
+# expect: many cookies last: ok:[v299]
+# expect: only invalid: err:CookieNotFoundError
+# expect: bad name only: err:CookieNotFoundError
+# expect: no header: err:CookieNotFoundError
+# expect: lowercase header key: ok:[low]
+# expect: signed next to malformed: ok:[alice]
+# expect: signed tampered: err:SignedCookieError
+# expect: signed missing: err:CookieNotFoundError
+# expect: http json neighbour: ok:[abc]
+# expect: http signed next to malformed: ok:[alice]
+# expect: http second cookie line: ok:[abc]
+# expect: http first cookie line: ok:[1]
+# expect: http unicode neighbour: ok:[tok]
+# expect: http only invalid: err:CookieNotFoundError
+
+from @lam/vulture import Server, Request, Response, InjectResponse
+from lamerrors import Result
+
+go! {
+    import (
+        "fmt"
+        "io"
+        "net/http"
+        "strings"
+    )
+}
+
+func describe(result: Result[str]) -> str {
+    if result.ok() {
+        v: str = str(result.value)
+        return "ok:[" + v + "]"
+    }
+    return "err:" + result.error.kind
+}
+
+func cookieHandler(req: Request, res: Response) {
+    name: str = req.queryGet("n")
+    res.text(describe(req.cookie(name)))
+}
+
+func signedHandler(req: Request, res: Response) {
+    res.text(describe(req.signedCookie(req.queryGet("n"), "supersecret")))
+}
+
+func setSignedHandler(req: Request, res: Response) {
+    res.signedCookie("sess", "alice", "supersecret")
+    res.text("set")
+}
+
+func probe(srv: Server, header: str, name: str) -> str {
+    headers: dict[str, str] = {"Cookie": header}
+    r: InjectResponse = srv.inject("GET", "/c?n=" + name, "", headers)
+    body: any = r.body
+    return str(body)
+}
+
+func probeSigned(srv: Server, header: str, name: str) -> str {
+    headers: dict[str, str] = {"Cookie": header}
+    r: InjectResponse = srv.inject("GET", "/s?n=" + name, "", headers)
+    body: any = r.body
+    return str(body)
+}
+
+func main() {
+    srv: Server = Server()
+    srv.get("/c", cookieHandler)
+    srv.get("/s", signedHandler)
+    srv.get("/set", setSignedHandler)
+
+    jsonHeader: str = "consent={\"a\":1,\"b\":2}; luxyt_csrf=abc"
+    print("json neighbour: " + probe(srv, jsonHeader, "luxyt_csrf"))
+    print("json cookie itself: " + probe(srv, jsonHeader, "consent"))
+    print("json first after: " + probe(srv, "luxyt_csrf=abc; consent={\"a\":1,\"b\":2}", "luxyt_csrf"))
+
+    print("quoted: " + probe(srv, "q=\"hello world\"; z=1", "q"))
+    print("quoted empty: " + probe(srv, "q=\"\"; z=1", "q"))
+    print("unbalanced quote skipped: " + probe(srv, "q=\"abc; z=1", "q"))
+    print("unbalanced quote neighbour: " + probe(srv, "q=\"abc; z=1", "z"))
+
+    print("spaces around pairs: " + probe(srv, "   a=1 ;    b=2   ;c=3  ", "b"))
+    print("space inside value: " + probe(srv, "a=hello world; b=2", "a"))
+
+    print("commas in value: " + probe(srv, "a=1,2,3; b=x", "a"))
+    print("comma neighbour: " + probe(srv, "a=1,2,3; b=x", "b"))
+
+    print("empty name neighbour: " + probe(srv, "=foo; ok=1", "ok"))
+    print("empty parts neighbour: " + probe(srv, ";; ; a=1;;b=2;", "b"))
+    print("value-less pair: " + probe(srv, "flag; a=1", "flag"))
+
+    print("equals in value: " + probe(srv, "tok=a=b==; x=1", "tok"))
+
+    unicodeHeader: str = "name=héllo; ok=1; ñ=x; after=2"
+    print("unicode value skipped: " + probe(srv, unicodeHeader, "name"))
+    print("unicode value neighbour: " + probe(srv, unicodeHeader, "ok"))
+    print("unicode name neighbour: " + probe(srv, unicodeHeader, "after"))
+    print("backslash value skipped: " + probe(srv, "b=a\\b; ok=1", "b"))
+
+    print("duplicate names: " + probe(srv, "sid=first; other=1; sid=second", "sid"))
+
+    many: str = ""
+    go! {
+        parts := make([]string, 0, 300)
+        for i := 0; i < 300; i++ {
+            if i%7 == 3 {
+                parts = append(parts, fmt.Sprintf("junk%d={\"i\":%d}", i, i))
+                continue
+            }
+            parts = append(parts, fmt.Sprintf("c%d=v%d", i, i))
+        }
+        many = strings.Join(parts, "; ")
+    }
+    print("many cookies: " + probe(srv, many, "c151"))
+    print("many cookies last: " + probe(srv, many, "c299"))
+
+    print("only invalid: " + probe(srv, "consent={\"a\":1,\"b\":2}", "consent"))
+    print("bad name only: " + probe(srv, "bad cookie=value", "broken"))
+
+    none: InjectResponse = srv.inject("GET", "/c?n=x")
+    noneBody: any = none.body
+    print("no header: " + str(noneBody))
+
+    lowHeaders: dict[str, str] = {"cookie": "consent={\"a\":1}; low=low"}
+    low: InjectResponse = srv.inject("GET", "/c?n=low", "", lowHeaders)
+    lowBody: any = low.body
+    print("lowercase header key: " + str(lowBody))
+
+    setResp: InjectResponse = srv.inject("GET", "/set")
+    signedPair: str = setResp.header("Set-Cookie")
+    go! {
+        if idx := strings.Index(signedPair, ";"); idx > 0 {
+            signedPair = signedPair[:idx]
+        }
+    }
+    signedHeader: str = "consent={\"a\":1,\"b\":2}; " + signedPair + "; theme=dark"
+    print("signed next to malformed: " + probeSigned(srv, signedHeader, "sess"))
+    tampered: str = "consent={\"a\":1}; " + signedPair + "x"
+    print("signed tampered: " + probeSigned(srv, tampered, "sess"))
+    print("signed missing: " + probeSigned(srv, "consent={\"a\":1}", "sess"))
+
+    _ = srv.listenBackground(0).unwrap()
+    address: str = srv.boundAddr
+    go! {
+        base := "http://" + address
+        defer srv.Shutdown(5000)
+        call := func(path string, cookieLines ...string) string {
+            request, err := http.NewRequest("GET", base+path, nil)
+            if err != nil {
+                return err.Error()
+            }
+            for _, line := range cookieLines {
+                request.Header.Add("Cookie", line)
+            }
+            resp, err := http.DefaultClient.Do(request)
+            if err != nil {
+                return err.Error()
+            }
+            defer resp.Body.Close()
+            data, _ := io.ReadAll(resp.Body)
+            return string(data)
+        }
+        fmt.Println("http json neighbour: " + call("/c?n=luxyt_csrf", "consent={\"a\":1,\"b\":2}; luxyt_csrf=abc"))
+        fmt.Println("http signed next to malformed: " + call("/s?n=sess", signedHeader))
+        fmt.Println("http second cookie line: " + call("/c?n=luxyt_csrf", "consent={\"a\":1,\"b\":2}; a=1", "luxyt_csrf=abc"))
+        fmt.Println("http first cookie line: " + call("/c?n=a", "consent={\"a\":1,\"b\":2}; a=1", "luxyt_csrf=abc"))
+        fmt.Println("http unicode neighbour: " + call("/c?n=csrf", "name=héllo; csrf=tok"))
+        fmt.Println("http only invalid: " + call("/c?n=consent", "consent={\"a\":1,\"b\":2}"))
+    }
+}

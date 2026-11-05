@@ -757,6 +757,48 @@ go! {
         return existing + "\n" + next
     }
 
+    // “lamRequestCookieLines“ gathers every Cookie header value of a
+    // request, matching the key case-insensitively (inject callers may
+    // pass "cookie"). Keys are sorted so lookups are deterministic when
+    // a map holds more than one spelling. Over HTTP the dispatcher joins
+    // repeated Cookie lines with "; " before they reach this map.
+    func lamRequestCookieLines(req *Request) []string {
+        keys := make([]string, 0, 1)
+        for k := range req.Headers {
+            if strings.EqualFold(k, "Cookie") {
+                keys = append(keys, k)
+            }
+        }
+        slices.Sort(keys)
+        lines := make([]string, 0, len(keys))
+        for _, k := range keys {
+            if v := req.Headers[k]; v != "" {
+                lines = append(lines, v)
+            }
+        }
+        return lines
+    }
+
+    // “lamRequestCookie“ is the single cookie reader behind
+    // “Request.cookie“ and “Request.signedCookie“. It delegates to
+    // net/http's lenient request-side parser (“http.Request.Cookie“,
+    // i.e. readCookies): split on ";", trim, cut name/value at the first
+    // "=", skip pairs with an invalid name token or value octets, strip
+    // one pair of surrounding quotes, return the first match. Unlike
+    // “http.ParseCookie“, one malformed pair never hides the others.
+    func lamRequestCookie(req *Request, name string) (string, bool) {
+        lines := lamRequestCookieLines(req)
+        if len(lines) == 0 {
+            return "", false
+        }
+        probe := &http.Request{Header: http.Header{"Cookie": lines}}
+        c, err := probe.Cookie(name)
+        if err != nil {
+            return "", false
+        }
+        return c.Value, true
+    }
+
     // ─── Cookie signing helpers ────────────────────────────────
     // HMAC-SHA256 over the raw value, encoded with URL-safe base64.
     // Format on the wire: “<value>.<sig>“ so the cookie is readable
@@ -2486,32 +2528,18 @@ class Request {
     }
 
     func cookie(self, name: str) -> Result[str] {
-        #- Parse and return one request cookie. Missing cookies and malformed
-        Cookie headers are distinct explicit failures, never empty-string
-        sentinels. -#
+        #- Return the value of the request cookie ``name`` (surrounding
+        double quotes removed). The Cookie header is parsed leniently,
+        like browsers and Go's ``http.Request.Cookies()``: a malformed pair
+        (an invalid name, or a value with ``"``, ``\``, control or non-ASCII
+        bytes — e.g. ``consent={"a":1}`` set by another app) is skipped and
+        every valid pair stays readable. When a name repeats, the first
+        pair wins (browsers send more specific paths first). An absent or
+        skipped cookie is ``CookieNotFoundError``; since 3.5.1 this method
+        never returns ``CookieParseError``. -#
         go! {
-            raw := ""
-            for k, v := range s.Headers {
-                if strings.EqualFold(k, "Cookie") {
-                    raw = v
-                    break
-                }
-            }
-            if raw == "" {
-                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
-                    "CookieNotFoundError", fmt.Sprintf("cookie %q was not provided", name), nil,
-                ))
-            }
-            cookies, err := http.ParseCookie(raw)
-            if err != nil {
-                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
-                    "CookieParseError", err.Error(), nil,
-                ))
-            }
-            for _, cookie := range cookies {
-                if cookie.Name == name {
-                    return LAMMERGEIER.Result.Ok(cookie.Value)
-                }
+            if value, ok := lamRequestCookie(s, name); ok {
+                return LAMMERGEIER.Result.Ok(value)
             }
             return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
                 "CookieNotFoundError", fmt.Sprintf("cookie %q was not provided", name), nil,
@@ -2597,7 +2625,10 @@ class Request {
     func signedCookie(self, name: str, secret: str) -> Result[str] {
         #- Verify a cookie created by ``Response.signedCookie``. Missing,
         malformed, tampered, and wrong-secret values are explicit failures;
-        verification remains constant-time. -#
+        verification remains constant-time. The cookie is read like
+        ``cookie(name)`` (lenient header parsing, first duplicate wins), so
+        an absent or skipped cookie is ``CookieNotFoundError`` and a bad
+        signature ``SignedCookieError``. -#
         raw: str = self.cookie(name)?
         go! {
             if v, ok := lamCookieVerify(raw, secret); ok {
@@ -7280,6 +7311,12 @@ go! {
             if len(vs) > 0 {
                 req.Headers[k] = vs[0]
             }
+        }
+        // An HTTP/1.1 client may split cookies over several Cookie
+        // lines; keep them all (joined as HTTP/2 does) so req.cookie
+        // and req.header("Cookie") see every pair, not just the first line.
+        if cookieLines := r.Header.Values("Cookie"); len(cookieLines) > 1 {
+            req.Headers["Cookie"] = strings.Join(cookieLines, "; ")
         }
         for k, vs := range r.URL.Query() {
             if len(vs) > 0 {
