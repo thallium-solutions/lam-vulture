@@ -1,0 +1,135 @@
+# Test: SseEmitter.wait ends long-lived event streams. A stream loop
+# `while not emitter.wait(ms) { ... }` stops when the client disconnects
+# and as soon as a graceful shutdown starts, so `shutdown()` does not
+# wait for the drain timeout while browsers hold streams open. A
+# standalone emitter (tests) only sleeps.
+#
+# expect: standalone wait: false after 30+ms
+# expect: standalone closed: false
+# expect: client stream ticks: yes
+# expect: client disconnect: ended
+# expect: shutdown streams: 2 ended
+# expect: shutdown prompt: yes
+# expect: wait after close: true
+# expect: ok
+
+from @lam/vulture import Server, Request, Response, SseEmitter
+from lamconcurrency import Channel
+from lamtime import Time
+
+go! {
+    import (
+        "bufio"
+        "net/http"
+        "strings"
+        "time"
+    )
+
+    // Open the stream, read until “ticks“ data events arrived, then drop
+    // the connection.
+    func sseTicks(url string, ticks int) int {
+        client := &http.Client{Timeout: 5 * time.Second}
+        resp, err := client.Get(url)
+        if err != nil {
+            return 0
+        }
+        defer resp.Body.Close()
+        seen := 0
+        scanner := bufio.NewScanner(resp.Body)
+        for scanner.Scan() {
+            if strings.HasPrefix(scanner.Text(), "data:") {
+                seen++
+                if seen >= ticks {
+                    return seen
+                }
+            }
+        }
+        return seen
+    }
+
+    // Open the stream in the background and keep it open until the
+    // server ends it.
+    func sseHold(url string, opened chan bool) {
+        go func() {
+            client := &http.Client{Timeout: 30 * time.Second}
+            resp, err := client.Get(url)
+            if err != nil {
+                opened <- false
+                return
+            }
+            opened <- true
+            defer resp.Body.Close()
+            scanner := bufio.NewScanner(resp.Body)
+            for scanner.Scan() {
+            }
+        }()
+    }
+}
+
+class Streams {
+    func init(self) {
+        self.ended: Channel = Channel(8)
+    }
+
+    func handle(self, _req: Request, res: Response) {
+        res.sse(self.stream)
+    }
+
+    func stream(self, emitter: SseEmitter) {
+        emitter.send("open")
+        while not emitter.wait(20) {
+            emitter.send("tick")
+        }
+        _ = self.ended.send("ended")
+    }
+}
+
+func main() {
+    standalone: SseEmitter = SseEmitter()
+    started: int = Time.nowUnixMilli()
+    waited: bool = standalone.wait(30)
+    elapsed: int = Time.nowUnixMilli() - started
+    print(f"standalone wait: {waited} after {'30+' if elapsed >= 30 else str(elapsed)}ms")
+    print(f"standalone closed: {standalone.closed}")
+
+    streams: Streams = Streams()
+    srv: Server = Server()
+    srv.get("/events", streams.handle)
+    _ = srv.listenBackground(18789).unwrap()
+
+    ticks: int = 0
+    go! {
+        ticks = sseTicks("http://127.0.0.1:18789/events", 4)
+    }
+    print(f"client stream ticks: {'yes' if ticks == 4 else str(ticks)}")
+    print(f"client disconnect: {streams.ended.receiveTimeout(3000).unwrapOr('timeout')}")
+
+    opened: int = 0
+    go! {
+        ch := make(chan bool, 2)
+        sseHold("http://127.0.0.1:18789/events", ch)
+        sseHold("http://127.0.0.1:18789/events", ch)
+        for i := 0; i < 2; i++ {
+            if <-ch {
+                opened++
+            }
+        }
+    }
+    Time.sleepMs(100)
+    begun: int = Time.nowUnixMilli()
+    srv.shutdown(5000)
+    took: int = Time.nowUnixMilli() - begun
+    endedCount: int = 0
+    for _ in range(opened) {
+        if streams.ended.receiveTimeout(3000).ok() {
+            endedCount += 1
+        }
+    }
+    print(f"shutdown streams: {endedCount} ended")
+    print(f"shutdown prompt: {'yes' if took < 2000 else str(took)}")
+
+    closedEmitter: SseEmitter = SseEmitter()
+    closedEmitter.close()
+    print(f"wait after close: {closedEmitter.wait(1000)}")
+    print("ok")
+}

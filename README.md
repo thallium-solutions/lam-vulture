@@ -27,7 +27,7 @@ lamc install https://github.com/thallium-solutions/lam-vulture.git
 Install the registry release:
 
 ```bash
-lamc install @lam/vulture@3.5.1
+lamc install @lam/vulture@3.6.0
 ```
 
 Install a local checkout during development:
@@ -282,7 +282,7 @@ The complete public implementation is exported from `__init__.lam`.
 - `RouteOptions` — typed per-route limits, timeout, streaming, hooks, schemas (multipart JSON fields included), a 413 handler, and metadata.
 - `SchemaIssue` — one schema-validation failure: field path, keyword, message, value, multipart part.
 - `InjectResponse` — typed `status`, `body`, and `headers` from in-process dispatch.
-- `SseEmitter` — Server-Sent Event data, named events, comments, and close.
+- `SseEmitter` — Server-Sent Event data, named events, comments, close, and `wait(timeoutMs)`: true once the client disconnected or the server began shutting down, so `while not emitter.wait(15000) { emitter.comment("ping") }` streams end with the request or a graceful shutdown.
 
 ### Form fields
 

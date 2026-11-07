@@ -2,6 +2,17 @@
 
 All notable changes to `@lam/vulture` are documented here.
 
+## [3.6.0] - 2026-11-07
+
+### Added
+
+- `SseEmitter.wait(timeoutMs) -> bool`: waits up to `timeoutMs` and returns
+  true — marking the emitter closed — once the client disconnected or the
+  server started `shutdown()` or `close()`. Long-lived event streams loop on
+  `while not emitter.wait(ms) { ... }`; a graceful `shutdown()` no longer
+  waits for its drain timeout while browsers keep streams open. An emitter
+  built outside a request only sleeps.
+
 ## [3.5.1] - 2026-11-05
 
 ### Fixed

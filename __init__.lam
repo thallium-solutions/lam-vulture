@@ -3952,6 +3952,47 @@ class SseEmitter {
         self.writer: any = None
         self.flusher: any = None
         self.closed: bool = false
+        # Set by the dispatcher: the request's done channel (the client
+        # went away) and the server's shutdown channel.
+        self.clientDone: any = None
+        self.serverStop: any = None
+    }
+
+    func wait(self, timeoutMs: int) -> bool {
+        #- Wait up to ``timeoutMs`` milliseconds. Returns true — and
+        marks the emitter closed — once the client disconnected or the
+        server started ``shutdown()``/``close()``; false when the time
+        elapsed first. Long-lived streams loop on it so a graceful
+        shutdown does not wait for its drain timeout:
+        ``while not emitter.wait(15000) { emitter.comment("ping") }``.
+        An emitter built outside a request only sleeps. -#
+        if self.closed {
+            return true
+        }
+        stopped: bool = false
+        go! {
+            var clientDone <-chan struct{}
+            if ch, ok := s.ClientDone.(<-chan struct{}); ok {
+                clientDone = ch
+            }
+            var serverStop chan struct{}
+            if ch, ok := s.ServerStop.(chan struct{}); ok {
+                serverStop = ch
+            }
+            timer := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
+            defer timer.Stop()
+            select {
+            case <-clientDone:
+                stopped = true
+            case <-serverStop:
+                stopped = true
+            case <-timer.C:
+            }
+        }
+        if stopped {
+            self.closed = true
+        }
+        return stopped
     }
 
     func send(self, data: str) {
@@ -4528,8 +4569,12 @@ class Server {
         self.boundAddr: str = ""
         self.rawSrv: any = None
         self.rawMu: any = None
+        # Closed when shutdown()/close() starts so event streams waiting
+        # in ``SseEmitter.wait`` end instead of holding the drain.
+        self.sseGate: any = None
         go! {
             s.RawMu = &sync.Mutex{}
+            s.SseGate = &lamSseGate{ch: make(chan struct{})}
         }
     }
 
@@ -5559,6 +5604,9 @@ class Server {
         drain. ``onClose`` hooks fire in reverse registration
         order. -#
         go! {
+            gate, _ := s.SseGate.(*lamSseGate)
+            gate.stop()
+            defer gate.reset()
             s.RawMu.(*sync.Mutex).Lock()
             defer s.RawMu.(*sync.Mutex).Unlock()
             if s.RawSrv != nil {
@@ -5578,6 +5626,9 @@ class Server {
         ``onClose`` hooks fire in reverse registration order *after*
         the listener stops accepting new requests. -#
         go! {
+            gate, _ := s.SseGate.(*lamSseGate)
+            gate.stop()
+            defer gate.reset()
             s.RawMu.(*sync.Mutex).Lock()
             defer s.RawMu.(*sync.Mutex).Unlock()
             if s.RawSrv != nil {
@@ -7244,6 +7295,48 @@ go! {
     }
 
     // ─── HTTP entry point ─────────────────────────────────────
+    // lamSseGate is closed when a shutdown starts and reopened when it
+    // completes, so event streams in SseEmitter.wait end promptly and a
+    // later listen() serves streams again.
+    type lamSseGate struct {
+        mu     sync.Mutex
+        ch     chan struct{}
+        closed bool
+    }
+
+    func (g *lamSseGate) current() chan struct{} {
+        if g == nil {
+            return nil
+        }
+        g.mu.Lock()
+        defer g.mu.Unlock()
+        return g.ch
+    }
+
+    func (g *lamSseGate) stop() {
+        if g == nil {
+            return
+        }
+        g.mu.Lock()
+        defer g.mu.Unlock()
+        if !g.closed {
+            close(g.ch)
+            g.closed = true
+        }
+    }
+
+    func (g *lamSseGate) reset() {
+        if g == nil {
+            return
+        }
+        g.mu.Lock()
+        defer g.mu.Unlock()
+        if g.closed {
+            g.ch = make(chan struct{})
+            g.closed = false
+        }
+    }
+
     func lamServerHandle(srv *Server, w http.ResponseWriter, r *http.Request) {
         // ── Top-level shield. Even if every inner “recover()“
         //
@@ -7587,6 +7680,10 @@ go! {
             emitter.Writer = w
             if fl, ok := w.(http.Flusher); ok {
                 emitter.Flusher = fl
+            }
+            emitter.ClientDone = r.Context().Done()
+            if gate, ok := srv.SseGate.(*lamSseGate); ok {
+                emitter.ServerStop = gate.current()
             }
             // Run the user-provided emitter loop. callHook gives us
             // panic recovery (so a bad SSE handler doesn't crash the
