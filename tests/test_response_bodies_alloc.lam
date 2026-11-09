@@ -1,0 +1,217 @@
+# Test: response bodies are produced once. A json handler result,
+# res.json(...), res.serialize(...), a returned html / xml page and
+# res.send / res.html / res.xml of a page are encoded or rendered straight
+# into the body (no second encoding pass, no fmt copy), with the bytes the
+# previous serializer wrote (key order, HTML-safe escaping, numbers); an
+# onSend hook still reads and rewrites the body as a string.
+#
+# expect: api: 200 application/json bytes=ok
+# expect: api allocation: ok
+# expect: res-json: 200 application/json same=true
+# expect: serialize: same=true
+# expect: serialize-dict: {"a":[1,2],"b":"\u003c\u0026\u003e","c":null}
+# expect: escapes: {"bad":"�","big":1e+21,"html":"\u003cscript\u003e\u0026","line":"\u2028","n":1e-7,"neg":0}
+# expect: page: 200 text/html; charset=utf-8 size=ok
+# expect: page allocation: ok
+# expect: send-html: same=true res-html: same=true
+# expect: feed: 200 application/xml; charset=utf-8 same=true
+# expect: send-xml: same=true res-xml: same=true
+# expect: feed allocation: ok
+# expect: hooked: <html><body><main>hi</main><script src="/live.js"></script></body></html>
+# expect: cycle: 500 {"error":"json marshal: json: error calling MarshalJSON for type main.LamJSON: json: unsupported value: encountered a cycle via map[string]interface {}"}
+# expect: problem: 404 application/problem+json {"detail":"no \u003cproduct\u003e","instance":"/missing","status":404,"title":"Not Found","type":"about:blank"}
+
+from @lam/vulture import InjectResponse, Server, Request, Response, HttpError
+from lamjson import Json
+
+go! {
+    import "runtime"
+}
+
+func allocated() -> int {
+    total: int = 0
+    go! {
+        var ms runtime.MemStats
+        runtime.ReadMemStats(&ms)
+        total = int(ms.TotalAlloc)
+    }
+    return total
+}
+
+class Product {
+    func init(self, i: int) {
+        self.id: str = f"p-{i:04d}"
+        self.name: str = f"Bag <{i}> & strap"
+        self.price: float = i * 10.5
+        self.images: list[str] = [f"/img/{i}/card.avif", f"/img/{i}/full.avif"]
+        self.soldOut: bool = i % 7 == 0
+        self.tags: dict[str, str] = {"brand": f"Brand {i % 5}", "color": "black"}
+    }
+
+    func __json__(self) -> json {
+        images: list[json] = [{"card": url, "full": url + "?w=1600"} for url in self.images]
+        return {"id": self.id, "name": self.name, "price": self.price, "images": images, "soldOut": self.soldOut, "tags": self.tags, "discount": None}
+    }
+}
+
+func payload() -> json {
+    products: list[json] = [json(Product(i)) for i in range(50)]
+    return {"products": products, "page": 1, "total": 50}
+}
+
+func api(req: Request, res: Response) -> json {
+    return payload()
+}
+
+func resJson(req: Request, res: Response) {
+    res.json(payload())
+}
+
+func card(i: int) -> html {
+    return <><article class="card" data-id="${i}"><h2>Product ${i} &amp; co</h2><p>${i * 3} EUR</p></article></>
+}
+
+func pageOf(n: int) -> html {
+    cards: list[html] = [card(i) for i in range(n)]
+    return <><!DOCTYPE html><html><body><main>${cards}</main></body></html></>
+}
+
+func page(req: Request, res: Response) -> html {
+    return pageOf(200)
+}
+
+func sendHtml(req: Request, res: Response) {
+    res.send(pageOf(200))
+}
+
+func resHtml(req: Request, res: Response) {
+    res.html(pageOf(200))
+}
+
+func feedOf(n: int) -> xml {
+    items: list[xml] = [<><item id="${i}"><title>Item ${i} &lt;x&gt;</title></item></> for i in range(n)]
+    return <><rss><channel>${items}</channel></rss></>
+}
+
+func feed(req: Request, res: Response) -> xml {
+    return feedOf(200)
+}
+
+func sendXml(req: Request, res: Response) {
+    res.send(feedOf(200))
+}
+
+func resXml(req: Request, res: Response) {
+    res.xml(feedOf(200))
+}
+
+func hookedPage(req: Request, res: Response) -> html {
+    return <><html><body><main>hi</main></body></html></>
+}
+
+func cyclic(req: Request, res: Response) -> json {
+    doc: json = {"name": "loop"}
+    doc["self"] = doc
+    return doc
+}
+
+func missing(req: Request, res: Response) -> json {
+    throw HttpError.notFound("no <product>")
+}
+
+func injectScript(req: Request, res: Response) {
+    at: int = res.body.lastIndex("</body>")
+    if at >= 0 {
+        res.body = res.body[:at] + "<script src=\"/live.js\"></script>" + res.body[at:]
+    }
+}
+
+func perBuild(kind: str) -> int {
+    doc: json = None
+    page: html = <></>
+    items: xml = <></>
+    before: int = allocated()
+    for __i in range(20) {
+        if kind == "api" {
+            doc = payload()
+        } elif kind == "page" {
+            page = pageOf(200)
+        } else {
+            items = feedOf(200)
+        }
+    }
+    total: int = allocated() - before
+    if len(doc) + len(str(page)) + len(str(items)) < 0 {
+        print("unreachable")
+    }
+    return total // 20
+}
+
+func perRequest(srv: Server, path: str) -> int {
+    _ = srv.inject("GET", path)
+    before: int = allocated()
+    for __i in range(20) {
+        _ = srv.inject("GET", path)
+    }
+    return (allocated() - before) // 20
+}
+
+func main() {
+    srv: Server = Server()
+    srv.get("/api", api)
+    srv.get("/res-json", resJson)
+    srv.get("/page", page)
+    srv.get("/send-html", sendHtml)
+    srv.get("/res-html", resHtml)
+    srv.get("/feed", feed)
+    srv.get("/send-xml", sendXml)
+    srv.get("/res-xml", resXml)
+    srv.get("/missing", missing)
+    srv.get("/cycle", cyclic)
+
+    expected: str = Json.encode(payload()).unwrap()
+    r: InjectResponse = srv.inject("GET", "/api")
+    print(f"api: {r.status} {r.header('Content-Type')} bytes={'ok' if r.body == expected else r.body}")
+    # What a request allocates besides building the payload: about one
+    # copy of the body (the encoding), not a normalized copy of the
+    # payload and a second encoding.
+    apiBytes: int = perRequest(srv, "/api") - perBuild("api")
+    print(f"api allocation: {'ok' if apiBytes < len(expected) + len(expected) // 4 + 4096 else str(apiBytes) + ' bytes per request for ' + str(len(expected))}")
+    rj: InjectResponse = srv.inject("GET", "/res-json")
+    print(f"res-json: {rj.status} {rj.header('Content-Type')} same={rj.body == expected}")
+
+    res: Response = Response()
+    print(f"serialize: same={res.serialize(payload()) == expected}")
+    dictPayload: dict[str, any] = {"b": "<&>", "a": [1, 2], "c": None}
+    print(f"serialize-dict: {res.serialize(dictPayload)}")
+    tricky: json = {"html": "<script>&", "line": "\u2028", "n": 0.0000001, "big": 1e21, "neg": -0.0, "bad": Json.getStr(Json.decode("{\"s\": \"\\ufffd\"}").unwrap(), "s")}
+    print(f"escapes: {res.serialize(tricky)}")
+
+    html: str = str(pageOf(200))
+    p: InjectResponse = srv.inject("GET", "/page")
+    print(f"page: {p.status} {p.header('Content-Type')} size={'ok' if p.body == html else str(len(p.body))}")
+    pageBytes: int = perRequest(srv, "/send-html") - perBuild("page")
+    print(f"page allocation: {'ok' if pageBytes < len(html) + len(html) // 4 + 4096 else str(pageBytes) + ' bytes per request for ' + str(len(html))}")
+    print(f"send-html: same={srv.inject('GET', '/send-html').body == html} res-html: same={srv.inject('GET', '/res-html').body == html}")
+
+    feedText: str = str(feedOf(200))
+    f: InjectResponse = srv.inject("GET", "/feed")
+    print(f"feed: {f.status} {f.header('Content-Type')} same={f.body == feedText}")
+    print(f"send-xml: same={srv.inject('GET', '/send-xml').body == feedText} res-xml: same={srv.inject('GET', '/res-xml').body == feedText}")
+    feedBytes: int = perRequest(srv, "/send-xml") - perBuild("feed")
+    print(f"feed allocation: {'ok' if feedBytes < len(feedText) + len(feedText) // 4 + 4096 else str(feedBytes) + ' bytes per request for ' + str(len(feedText))}")
+
+    hooked: Server = Server()
+    hooked.get("/", hookedPage)
+    hooked.onSend(injectScript)
+    print(f"hooked: {hooked.inject('GET', '/').body}")
+
+    c: InjectResponse = srv.inject("GET", "/cycle")
+    print(f"cycle: {c.status} {c.body}")
+
+    problems: Server = Server()
+    problems.useProblemDetails()
+    problems.get("/missing", missing)
+    m: InjectResponse = problems.inject("GET", "/missing")
+    print(f"problem: {m.status} {m.header('Content-Type')} {m.body}")
+}

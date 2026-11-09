@@ -2,6 +2,23 @@
 
 All notable changes to `@lam/vulture` are documented here.
 
+## [3.7.0] - 2026-11-09
+
+### Changed
+
+- A `json` body is encoded once: a `json` handler result, `res.json(doc)`
+  and `res.serialize(doc)` use the value's own `MarshalJSON` and its fresh
+  bytes as the body string, instead of `encoding/json.Marshal`, which called
+  it, then checked and copied its output, then was copied again into a
+  string. The bytes and the errors are the same (key order, `<` `>` `&`
+  escaped, numbers; a cyclic value is still a 500 with the same message).
+  With lamc 4.9.0, whose encoder writes into a pooled buffer, a
+  50-product API response allocates about one copy of its body besides
+  building the payload (was about 7); `res.send(page)`, `res.html(page)` and
+  `res.xml(feed)` also stop copying the rendered page through `fmt` there
+  (`str(page)` is the page's own rendering). Still `lamc >=4.2`; `onSend`
+  hooks still read and rewrite `res.body` as a string.
+
 ## [3.6.0] - 2026-11-07
 
 ### Added

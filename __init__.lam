@@ -87,6 +87,7 @@ go! {
         "sync"
         "sync/atomic"
         "time"
+        "unsafe"
     )
 }
 
@@ -424,6 +425,19 @@ go! {
         return strings.Split(p, "/")
     }
 
+    // lamVultureJSONText is ``json.Marshal(value)`` of a json value as a string,
+    // byte for byte and error for error, with a single encoding: the value's
+    // own MarshalJSON (what json.Marshal calls, then copies and re-checks;
+    // lamc releases after 4.8.0 write it into a pooled buffer and return a
+    // fresh exact-size copy), whose fresh bytes back the string.
+    func lamVultureJSONText(value LamJSON) (string, error) {
+        b, err := value.MarshalJSON()
+        if err != nil {
+            return "", &json.MarshalerError{Type: reflect.TypeOf(value), Err: err}
+        }
+        return unsafe.String(unsafe.SliceData(b), len(b)), nil
+    }
+
     // Handlers may return the body: html, xml, json or str. The value is
     // sent with its default Content-Type unless the handler set one, and
     // only when the handler did not send a response itself.
@@ -459,7 +473,7 @@ go! {
                 if res.Sent {
                     return
                 }
-                b, err := json.Marshal(value)
+                text, err := lamVultureJSONText(value)
                 if err != nil {
                     res.Status = 500
                     res.Headers["Content-Type"] = "application/json"
@@ -467,7 +481,7 @@ go! {
                     res.Sent = true
                     return
                 }
-                lamSendValue(res, "application/json", string(b))
+                lamSendValue(res, "application/json", text)
             }
         case func(*Request, *Response) string:
             return func(req *Request, res *Response) {
@@ -3291,7 +3305,7 @@ class Response {
     func json(self, obj: json) -> Response {
         #- Marshal a native json value and send it with the JSON content type. -#
         go! {
-            b, err := json.Marshal(obj)
+            text, err := lamVultureJSONText(obj)
             if err != nil {
                 s.Status = 500
                 s.Body = fmt.Sprintf(`{"error":"json marshal: %v"}`, err)
@@ -3302,7 +3316,7 @@ class Response {
                 s.Headers = map[string]string{}
             }
             s.Headers["Content-Type"] = "application/json"
-            s.Body = string(b)
+            s.Body = text
             s.Sent = true
             return s
         }
@@ -3816,6 +3830,12 @@ class Response {
             // encoder.
             if bs, ok := body.(string); ok {
                 out = bs
+                return out
+            }
+            if doc, ok := body.(LamJSON); ok {
+                if text, err := lamVultureJSONText(doc); err == nil {
+                    out = text
+                }
                 return out
             }
             if b, err := json.Marshal(body); err == nil {
