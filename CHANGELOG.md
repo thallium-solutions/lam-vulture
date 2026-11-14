@@ -2,6 +2,24 @@
 
 All notable changes to `@lam/vulture` are documented here.
 
+## [3.7.1] - 2026-11-14
+
+### Fixed
+
+- The `RequestBodyReader` example counts the bytes of the chunks it reads
+  with `len(bytes(chunk))`: `len(chunk)` counts characters from lamc 4.14 on
+  (strings are sequences of characters), so a non-ASCII upload looked
+  smaller. Correct with lamc 4.13 and 4.14. No code change.
+
+### Testing
+
+- `test_stdlib_server_stream_body` also streams a non-ASCII body (13 "€"
+  and an "X", 40 bytes cut inside "€" by 16-byte chunks) and counts its
+  bytes; it fails with lamc 4.14 when the handler uses `len(chunk)`.
+- `test_stdlib_server_ctx_context` checks that the `None` stored in the
+  context comes back as `None` by comparing it instead of printing it
+  (lamc 4.14 prints `None`, earlier versions `<nil>`).
+
 ## [3.7.0] - 2026-11-09
 
 ### Changed

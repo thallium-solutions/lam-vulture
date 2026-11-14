@@ -21,6 +21,8 @@
 # expect: t2-chunks: 3
 # expect: t2-bytes: 40
 # expect: t2-body-empty: true
+# expect: t2-utf8-chunks: 3
+# expect: t2-utf8-bytes: 40
 # expect: t3-disk-contents: ABCDEFGHIJ
 # expect: t4-status: 413
 # expect: t5-copy-error: true
@@ -70,7 +72,8 @@ func streamedHandler(req: Request, res: Response) {
             break
         }
         chunkCount = chunkCount + 1
-        total = total + len(chunk)
+        # Bytes, not characters: len(str) counts characters since lamc 4.14.
+        total = total + len(bytes(chunk))
     }
     _ = r.close().unwrap()
     res.json( {
@@ -183,6 +186,30 @@ func main() {
     print(f"t2-chunks: {chunks2}")
     print(f"t2-bytes: {bytes2}")
     print(f"t2-body-empty: {bodyEmpty2}")
+
+    # ── Test 2b: a non-ASCII body (13 × "€" + "X" = 40 bytes, 14
+    # characters) streamed in 16-byte chunks that cut "€" sequences:
+    # the handler counts bytes, as in the bodyReader() documentation.
+    utf8Payload: str = "€" * 13 + "X"
+    r2u: dict[str, any] = httpPost("http://" + addr + "/streamed", utf8Payload)
+    b2u: any = r2u["body"]
+    chunks2u: int = 0
+    bytes2u: int = 0
+    go! {
+        if bs, ok := b2u.(string); ok {
+            var parsed map[string]interface{}
+            if err := json.Unmarshal([]byte(bs), &parsed); err == nil {
+                if n, ok := parsed["chunks"].(float64); ok {
+                    chunks2u = int(n)
+                }
+                if n, ok := parsed["bytes"].(float64); ok {
+                    bytes2u = int(n)
+                }
+            }
+        }
+    }
+    print(f"t2-utf8-chunks: {chunks2u}")
+    print(f"t2-utf8-bytes: {bytes2u}")
 
     # ── Test 3: streamed route copies bytes to disk.
     tmpPath: str = "/tmp/lam-stream-body-test.bin"

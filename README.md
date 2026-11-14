@@ -27,7 +27,7 @@ lamc install https://github.com/thallium-solutions/lam-vulture.git
 Install the registry release:
 
 ```bash
-lamc install @lam/vulture@3.7.0
+lamc install @lam/vulture@3.7.1
 ```
 
 Install a local checkout during development:

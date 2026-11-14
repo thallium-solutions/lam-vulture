@@ -1,4 +1,4 @@
-# expect: ctx-body: has=true in=true expired=true reason=stopped value=<nil>
+# expect: ctx-body: has=true in=true expired=true reason=stopped none=true
 
 from @lam/vulture import InjectResponse, Request, Response, Server
 
@@ -13,7 +13,9 @@ func inspect(req: Request, res: Response) {
     expired: bool = req.ctx.expired()
     reason: any = req.ctx.reason()
     value: any = req.ctx["nullable"]
-    res.text(f"has={hasValue} in={containsValue} expired={expired} reason={reason} value={value}")
+    # Compared, not printed: lamc 4.14 prints None as None (it was <nil>).
+    isNone: bool = value == None
+    res.text(f"has={hasValue} in={containsValue} expired={expired} reason={reason} none={isNone}")
 }
 
 func main() {

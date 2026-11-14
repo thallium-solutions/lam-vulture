@@ -2327,7 +2327,7 @@ class RequestBodyReader {
             if chunk == "" {
                 break
             }
-            total = total + len(chunk)
+            total = total + len(bytes(chunk))   # bytes, not characters
             # … sink chunk to disk or network …
         }
         _ = r.close().unwrap()
