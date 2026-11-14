@@ -1,0 +1,147 @@
+# Cross-feature stress over a real listener: a `Shop` class supplies the
+# handlers (bound methods), 80 requests are sent concurrently from async
+# tasks with `lamhttp` (counter increments, non-ASCII JSON echoes, 404s and
+# 405s mixed in), a slow request in flight while `shutdown` runs completes,
+# and the lifecycle hooks fire in order (`onReady`, `onListen`, `onClose`
+# in reverse registration order). Results are aggregated with
+# comprehensions; errors flow through `?` and `do/catch`.
+#
+# expect: lifecycle after listen: ready,listen
+# expect: concurrent: 80 responses statuses=[200 404 405]
+# expect: counter: 40 hits, last=40
+# expect: echoes: 20/20 byte-exact lengths=true
+# expect: slow request survives shutdown: 200 done
+# expect: lifecycle after shutdown: ready,listen,close-second,close-first
+# expect: refused after shutdown: true
+# expect: ok
+
+from @lam/vulture import Server, Request, Response
+from lamconcurrency import Atomic, Mutex
+from lamerrors import Result
+from lamhttp import Http, HttpResponse
+from lamjson import Json
+from lamtime import Time
+
+class Shop {
+    func init(self) {
+        self.hits: Atomic = Atomic(0)
+        self.lock: Mutex = Mutex()
+        self.events: list[str] = []
+    }
+
+    func record(self, event: str) {
+        self.lock.lock()
+        self.events.append(event)
+        self.lock.unlock()
+    }
+
+    func counter(self, _req: Request, res: Response) {
+        res.text(str(self.hits.increment()))
+    }
+
+    func echo(self, req: Request, _res: Response) -> json {
+        body: json = Json.decode(req.body).unwrap()
+        text: str = body.text
+        return {"echo": text, "bytes": len(bytes(text))}
+    }
+
+    func slow(self, _req: Request, res: Response) {
+        Time.sleepMs(600)
+        res.text("done")
+    }
+
+    func onReady(self, _srv: Server) {
+        self.record("ready")
+    }
+
+    func onListen(self, _srv: Server) {
+        self.record("listen")
+    }
+
+    func closeFirst(self, _srv: Server) {
+        self.record("close-first")
+    }
+
+    func closeSecond(self, _srv: Server) {
+        self.record("close-second")
+    }
+}
+
+async func send(base: str, i: int) -> Result[HttpResponse] {
+    kind: int = i % 4
+    if kind == 0 or kind == 1 {
+        return Http.get(base + "/counter")
+    }
+    if kind == 2 {
+        return Http.post(base + "/echo", "application/json", "{\"text\": \"Grüße #" + str(i) + " 東京 🦅\"}")
+    }
+    if i % 8 == 3 {
+        return Http.get(base + "/missing")
+    }
+    return Http.request("DELETE", base + "/counter")
+}
+
+async func slowTask(base: str) -> Result[HttpResponse] {
+    return Http.get(base + "/slow")
+}
+
+func echoOk(r: HttpResponse) -> Result[bool] {
+    doc: json = Json.decode(r.body)?
+    text: str = doc.echo
+    size: int = doc.bytes
+    return Result.Ok(size == len(bytes(text)) and text.startsWith("Grüße #"))
+}
+
+func main() {
+    shop: Shop = Shop()
+    srv: Server = Server()
+    srv.get("/counter", shop.counter)
+    srv.post("/echo", shop.echo)
+    srv.get("/slow", shop.slow)
+    srv.onReady(shop.onReady)
+    srv.onListen(shop.onListen)
+    srv.onClose(shop.closeFirst)
+    srv.onClose(shop.closeSecond)
+    _ = srv.listenBackground(0).unwrap()
+    base: str = "http://" + srv.boundAddr
+    print(f"lifecycle after listen: {','.join(shop.events)}")
+
+    pending = [send(base, i) for i in range(80)]
+    responses: list[HttpResponse] = []
+    for task in pending {
+        r: Result[HttpResponse] = await task
+        if r.ok() {
+            responses.append(r.unwrap())
+        }
+    }
+    statuses: list[int] = sorted(set([r.status for r in responses]))
+    print(f"concurrent: {len(responses)} responses statuses={statuses}")
+    counts: list[int] = sorted([int(r.body) for r in responses if r.status == 200 and not r.body.startsWith("{")])
+    print(f"counter: {len(counts)} hits, last={counts[len(counts) - 1]}")
+    echoes: list[HttpResponse] = [r for r in responses if r.body.startsWith("{")]
+    good: int = 0
+    do {
+        for r in echoes {
+            if echoOk(r)? {
+                good++
+            }
+        }
+    } catch err {
+        print(f"echo decode failed: {err}")
+    }
+    lengths: bool = echoes.all(lambda r: r.header("Content-Length") == str(len(bytes(r.body))))
+    print(f"echoes: {good}/{len(echoes)} byte-exact lengths={lengths}")
+
+    inFlight = slowTask(base)
+    Time.sleepMs(150)
+    srv.shutdown(5000)
+    slow: Result[HttpResponse] = await inFlight
+    if slow.ok() {
+        print(f"slow request survives shutdown: {slow.unwrap().status} {slow.unwrap().body}")
+    } else {
+        print(f"slow request survives shutdown: {slow.error}")
+    }
+    print(f"lifecycle after shutdown: {','.join(shop.events)}")
+    print(f"refused after shutdown: {not Http.get(base + '/counter').ok()}")
+    print("ok")
+}

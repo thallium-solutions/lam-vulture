@@ -2,6 +2,26 @@
 
 All notable changes to `@lam/vulture` are documented here.
 
+## [3.7.2] - 2026-11-14
+
+### Tests
+
+- `tests/test_server_api_gaps.lam` (inject): the public API no test called —
+  server, request and reply decorators (`decorate`, `decorateRequest`,
+  `decorateReply`, `decorateResponse`, `dec`, `hasDec`, `hasDecorator`),
+  `addContentTypeParser` (parameters stripped, overriding `text/plain`),
+  `options` and `all` routes, the `HttpError` factories with `toString` and
+  `withRetryAfter`, `Problem.withIssues`, request ids (`setId`/`id`),
+  `startTime`, `ips`/`realScheme` with and without `trustProxy`, `push` on
+  HTTP/1, `clearPayloadTooLargeHandler`, `clearSchemaIssueHandler`, and
+  non-ASCII path parameters, queries and JSON bodies with byte-exact
+  `Content-Length`.
+- `tests/test_server_concurrent_http.lam` (real listener): a `Shop` class's
+  bound methods as handlers and lifecycle hooks, 80 concurrent `lamhttp`
+  requests from async tasks (counter, non-ASCII JSON echoes, 404s and 405s),
+  a slow request completing across `shutdown`, `onClose` hooks in reverse
+  order, connections refused afterwards.
+
 ## [3.7.1] - 2026-11-14
 
 ### Fixed
